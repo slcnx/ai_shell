@@ -74,6 +74,41 @@ struct NativeImportResult {
     parse_errors: i64,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct NativeSessionCandidate {
+    provider: String,
+    session_id: String,
+    started_at: i64,
+    last_seen_at: i64,
+    source_files: i64,
+    record_count: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct NativeSessionListResponse {
+    items: Vec<NativeSessionCandidate>,
+    total: i64,
+    offset: i64,
+    limit: i64,
+    has_more: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct NativeSessionPreviewRow {
+    kind: String,
+    content: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct NativeSessionPreviewResponse {
+    session_id: String,
+    rows: Vec<NativeSessionPreviewRow>,
+    total_rows: i64,
+    loaded_rows: i64,
+    has_more: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ObservabilityInfo {
     log_path: String,
@@ -1675,6 +1710,403 @@ fn collect_gemini_metas(root: &Path) -> Result<Vec<GeminiSessionMeta>> {
         }
     }
     Ok(metas)
+}
+
+fn clip_preview_content(value: &str, max_chars: usize) -> String {
+    let sanitized = sanitize_log_text(value);
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let clipped = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
+        format!("{}...", clipped)
+    } else {
+        clipped
+    }
+}
+
+fn push_preview_row(
+    rows: &mut Vec<NativeSessionPreviewRow>,
+    seen: &mut HashSet<String>,
+    kind: &str,
+    content: &str,
+    created_at: i64,
+) {
+    let clipped = clip_preview_content(content, 420);
+    if clipped.trim().is_empty() {
+        return;
+    }
+    let key = format!("{}:{}:{}", kind, created_at, clipped);
+    if !seen.insert(key) {
+        return;
+    }
+    rows.push(NativeSessionPreviewRow {
+        kind: kind.to_string(),
+        content: clipped,
+        created_at,
+    });
+}
+
+fn preview_kind_order(kind: &str) -> i32 {
+    match kind {
+        "input" => 0,
+        "output" => 1,
+        _ => 2,
+    }
+}
+
+fn sort_preview_rows(rows: &mut Vec<NativeSessionPreviewRow>) {
+    rows.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then(preview_kind_order(&a.kind).cmp(&preview_kind_order(&b.kind)))
+            .then(a.content.cmp(&b.content))
+    });
+}
+
+fn merge_session_candidate(
+    map: &mut HashMap<String, NativeSessionCandidate>,
+    provider: &str,
+    session_id: &str,
+    started_at: i64,
+    mtime: i64,
+) {
+    let sid = session_id.trim();
+    if sid.is_empty() {
+        return;
+    }
+    let last_seen = if started_at > 0 {
+        started_at.max(mtime)
+    } else {
+        mtime
+    };
+    let entry = map
+        .entry(sid.to_string())
+        .or_insert_with(|| NativeSessionCandidate {
+            provider: provider.to_string(),
+            session_id: sid.to_string(),
+            started_at: 0,
+            last_seen_at: 0,
+            source_files: 0,
+            record_count: 0,
+        });
+    if started_at > 0 && (entry.started_at == 0 || started_at < entry.started_at) {
+        entry.started_at = started_at;
+    }
+    if last_seen > entry.last_seen_at {
+        entry.last_seen_at = last_seen;
+    }
+    entry.source_files += 1;
+}
+
+fn sort_session_candidates(items: &mut Vec<NativeSessionCandidate>) {
+    items.sort_by(|a, b| {
+        b.last_seen_at
+            .cmp(&a.last_seen_at)
+            .then(b.started_at.cmp(&a.started_at))
+            .then(a.session_id.cmp(&b.session_id))
+    });
+}
+
+fn list_native_session_candidates_for_provider(provider: &str) -> Result<Vec<NativeSessionCandidate>> {
+    let mut map = HashMap::<String, NativeSessionCandidate>::new();
+    match provider {
+        "codex" => {
+            let sessions_dir = codex_sessions_dir().ok_or_else(|| anyhow!("failed to resolve CODEX_HOME"))?;
+            if !sessions_dir.exists() {
+                return Ok(Vec::new());
+            }
+            let metas = collect_rollout_metas(&sessions_dir)?;
+            for meta in metas {
+                merge_session_candidate(
+                    &mut map,
+                    "codex",
+                    &meta.session_id,
+                    meta.started_at,
+                    meta.mtime,
+                );
+            }
+        }
+        "claude" => {
+            let projects_dir = claude_projects_dir().ok_or_else(|| anyhow!("failed to resolve CLAUDE_HOME"))?;
+            if !projects_dir.exists() {
+                return Ok(Vec::new());
+            }
+            let metas = collect_claude_metas(&projects_dir)?;
+            for meta in metas {
+                merge_session_candidate(
+                    &mut map,
+                    "claude",
+                    &meta.session_id,
+                    meta.started_at,
+                    meta.mtime,
+                );
+            }
+        }
+        "gemini" => {
+            let sessions_root =
+                gemini_sessions_root_dir().ok_or_else(|| anyhow!("failed to resolve GEMINI_HOME"))?;
+            if !sessions_root.exists() {
+                return Ok(Vec::new());
+            }
+            let metas = collect_gemini_metas(&sessions_root)?;
+            for meta in metas {
+                merge_session_candidate(
+                    &mut map,
+                    "gemini",
+                    &meta.session_id,
+                    meta.started_at,
+                    meta.mtime,
+                );
+            }
+        }
+        _ => return Ok(Vec::new()),
+    }
+    let mut items = map.into_values().collect::<Vec<_>>();
+    sort_session_candidates(&mut items);
+    Ok(items)
+}
+
+fn collect_codex_session_preview_rows(session_id: &str) -> Result<Vec<NativeSessionPreviewRow>> {
+    let sessions_dir = codex_sessions_dir().ok_or_else(|| anyhow!("failed to resolve CODEX_HOME"))?;
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut metas = collect_rollout_metas(&sessions_dir)?
+        .into_iter()
+        .filter(|meta| meta.session_id == session_id)
+        .collect::<Vec<_>>();
+    metas.sort_by_key(|meta| (meta.file_time_key, meta.started_at, meta.mtime));
+
+    let mut rows = Vec::<NativeSessionPreviewRow>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for meta in metas {
+        let file = match File::open(&meta.file_path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value = match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if value.get("type").and_then(|item| item.as_str()) != Some("response_item") {
+                continue;
+            }
+            let payload = match value.get("payload").and_then(|item| item.as_object()) {
+                Some(payload) => payload,
+                None => continue,
+            };
+            if payload.get("type").and_then(|item| item.as_str()) != Some("message") {
+                continue;
+            }
+            let (kind, content_type) = match payload.get("role").and_then(|item| item.as_str()) {
+                Some("user") => ("input", "input_text"),
+                Some("assistant") => ("output", "output_text"),
+                _ => continue,
+            };
+            let created_at = value
+                .get("timestamp")
+                .and_then(|item| item.as_str())
+                .and_then(parse_rfc3339_epoch_seconds)
+                .unwrap_or(meta.mtime);
+
+            let content_list = match payload.get("content").and_then(|item| item.as_array()) {
+                Some(list) => list,
+                None => continue,
+            };
+            for content_item in content_list {
+                if content_item.get("type").and_then(|item| item.as_str()) != Some(content_type) {
+                    continue;
+                }
+                let text = content_item
+                    .get("text")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("");
+                push_preview_row(&mut rows, &mut seen, kind, text, created_at);
+            }
+        }
+    }
+    sort_preview_rows(&mut rows);
+    Ok(rows)
+}
+
+fn collect_claude_session_preview_rows(session_id: &str) -> Result<Vec<NativeSessionPreviewRow>> {
+    let projects_dir = claude_projects_dir().ok_or_else(|| anyhow!("failed to resolve CLAUDE_HOME"))?;
+    if !projects_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut metas = collect_claude_metas(&projects_dir)?
+        .into_iter()
+        .filter(|meta| meta.session_id == session_id)
+        .collect::<Vec<_>>();
+    metas.sort_by_key(|meta| (meta.file_time_key, meta.started_at, meta.mtime));
+
+    let mut rows = Vec::<NativeSessionPreviewRow>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for meta in metas {
+        let file = match File::open(&meta.file_path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value = match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let row_session_id = value
+                .get("sessionId")
+                .and_then(|item| item.as_str())
+                .map(|item| item.trim().to_string())
+                .unwrap_or_default();
+            if row_session_id != session_id {
+                continue;
+            }
+            if value
+                .get("isSidechain")
+                .and_then(|item| item.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if value
+                .get("isMeta")
+                .and_then(|item| item.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let kind = match value.get("type").and_then(|item| item.as_str()) {
+                Some("user") => "input",
+                Some("assistant") => "output",
+                _ => continue,
+            };
+            let content_value = value
+                .get("message")
+                .and_then(|item| item.get("content"))
+                .or_else(|| value.get("content"))
+                .unwrap_or(&serde_json::Value::Null);
+            let content = text_from_json_value(content_value);
+            if content.trim().is_empty() {
+                continue;
+            }
+            let created_at = value
+                .get("timestamp")
+                .and_then(|item| item.as_str())
+                .and_then(parse_rfc3339_epoch_seconds)
+                .unwrap_or(meta.mtime);
+            push_preview_row(&mut rows, &mut seen, kind, &content, created_at);
+        }
+    }
+    sort_preview_rows(&mut rows);
+    Ok(rows)
+}
+
+fn collect_gemini_session_preview_rows(session_id: &str) -> Result<Vec<NativeSessionPreviewRow>> {
+    let sessions_root = gemini_sessions_root_dir().ok_or_else(|| anyhow!("failed to resolve GEMINI_HOME"))?;
+    if !sessions_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut metas = collect_gemini_metas(&sessions_root)?
+        .into_iter()
+        .filter(|meta| meta.session_id == session_id)
+        .collect::<Vec<_>>();
+    metas.sort_by_key(|meta| (meta.file_time_key, meta.started_at, meta.mtime));
+
+    let mut rows = Vec::<NativeSessionPreviewRow>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for meta in metas {
+        let raw = match std::fs::read_to_string(&meta.file_path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let value = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let row_session_id = value
+            .get("sessionId")
+            .and_then(|item| item.as_str())
+            .map(|item| item.trim().to_string())
+            .unwrap_or_default();
+        if row_session_id != session_id {
+            continue;
+        }
+        let fallback_ts = value
+            .get("lastUpdated")
+            .and_then(|item| item.as_str())
+            .and_then(parse_rfc3339_epoch_seconds)
+            .or_else(|| {
+                value
+                    .get("startTime")
+                    .and_then(|item| item.as_str())
+                    .and_then(parse_rfc3339_epoch_seconds)
+            })
+            .unwrap_or(meta.mtime);
+
+        let messages = match value.get("messages").and_then(|item| item.as_array()) {
+            Some(items) => items,
+            None => continue,
+        };
+        for message in messages {
+            let row_type = match message.get("type").and_then(|item| item.as_str()) {
+                Some("user") => "input",
+                Some("assistant") | Some("gemini") => "output",
+                _ => continue,
+            };
+            let content_value = message.get("content").unwrap_or(&serde_json::Value::Null);
+            let content = text_from_json_value(content_value);
+            if content.trim().is_empty() {
+                continue;
+            }
+            let created_at = message
+                .get("timestamp")
+                .and_then(|item| item.as_str())
+                .and_then(parse_rfc3339_epoch_seconds)
+                .unwrap_or(fallback_ts);
+            push_preview_row(&mut rows, &mut seen, row_type, &content, created_at);
+        }
+    }
+    sort_preview_rows(&mut rows);
+    Ok(rows)
+}
+
+fn collect_native_session_preview_rows_for_provider(
+    provider: &str,
+    session_id: &str,
+) -> Result<Vec<NativeSessionPreviewRow>> {
+    match provider {
+        "codex" => collect_codex_session_preview_rows(session_id),
+        "claude" => collect_claude_session_preview_rows(session_id),
+        "gemini" => collect_gemini_session_preview_rows(session_id),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn count_native_session_records_for_provider(provider: &str, session_id: &str) -> i64 {
+    collect_native_session_preview_rows_for_provider(provider, session_id)
+        .map(|rows| rows.len() as i64)
+        .unwrap_or(0)
 }
 
 fn save_bound_session_id(connection: &Connection, pane_id: &str, session_id: &str) -> Result<()> {
@@ -3284,6 +3716,129 @@ fn suggest_native_session_id(state: State<AppState>, pane_id: String) -> Result<
 }
 
 #[tauri::command]
+fn list_native_session_candidates(
+    state: State<AppState>,
+    pane_id: String,
+    offset: Option<i64>,
+    limit: Option<i64>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+) -> Result<NativeSessionListResponse, String> {
+    let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
+    let mut all_items =
+        list_native_session_candidates_for_provider(&provider).map_err(|error| error.to_string())?;
+
+    let normalized_sort_by = sort_by
+        .unwrap_or_else(|| "time".to_string())
+        .trim()
+        .to_lowercase();
+    let sort_by_records = normalized_sort_by == "records";
+    let normalized_sort_order = sort_order
+        .unwrap_or_else(|| "desc".to_string())
+        .trim()
+        .to_lowercase();
+    let desc = normalized_sort_order != "asc";
+
+    if sort_by_records {
+        for item in &mut all_items {
+            item.record_count = count_native_session_records_for_provider(&provider, &item.session_id);
+        }
+        all_items.sort_by(|a, b| {
+            let ord = a
+                .record_count
+                .cmp(&b.record_count)
+                .then(a.started_at.cmp(&b.started_at))
+                .then(a.last_seen_at.cmp(&b.last_seen_at))
+                .then(a.session_id.cmp(&b.session_id));
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+    } else {
+        all_items.sort_by(|a, b| {
+            let a_time = if a.started_at > 0 {
+                a.started_at
+            } else {
+                a.last_seen_at
+            };
+            let b_time = if b.started_at > 0 {
+                b.started_at
+            } else {
+                b.last_seen_at
+            };
+            let ord = a_time
+                .cmp(&b_time)
+                .then(a.last_seen_at.cmp(&b.last_seen_at))
+                .then(a.session_id.cmp(&b.session_id));
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+    }
+
+    let page_offset = offset.unwrap_or(0).max(0) as usize;
+    let page_limit = limit.unwrap_or(60).clamp(10, 240) as usize;
+    let total = all_items.len();
+    let mut items = all_items
+        .into_iter()
+        .skip(page_offset)
+        .take(page_limit)
+        .collect::<Vec<_>>();
+    if !sort_by_records {
+        for item in &mut items {
+            item.record_count = count_native_session_records_for_provider(&provider, &item.session_id);
+        }
+    }
+    let has_more = page_offset.saturating_add(items.len()) < total;
+
+    Ok(NativeSessionListResponse {
+        items,
+        total: total as i64,
+        offset: page_offset as i64,
+        limit: page_limit as i64,
+        has_more,
+    })
+}
+
+#[tauri::command]
+fn preview_native_session_messages(
+    state: State<AppState>,
+    pane_id: String,
+    session_id: String,
+    limit: Option<i64>,
+    load_all: Option<bool>,
+) -> Result<NativeSessionPreviewResponse, String> {
+    let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
+    let normalized = session_id.trim().to_string();
+    if normalized.is_empty() {
+        return Err("session_id is empty".to_string());
+    }
+    let message_limit = limit.unwrap_or(200).clamp(1, 5000) as usize;
+    let all_rows = collect_native_session_preview_rows_for_provider(&provider, &normalized)
+        .map_err(|error| error.to_string())?;
+    let total_rows = all_rows.len();
+    let load_all_flag = load_all.unwrap_or(false);
+    let rows = if load_all_flag || total_rows <= message_limit {
+        all_rows
+    } else {
+        all_rows.into_iter().take(message_limit).collect::<Vec<_>>()
+    };
+    let loaded_rows = rows.len();
+    let has_more = loaded_rows < total_rows;
+    Ok(NativeSessionPreviewResponse {
+        session_id: normalized,
+        rows,
+        total_rows: total_rows as i64,
+        loaded_rows: loaded_rows as i64,
+        has_more,
+    })
+}
+
+#[tauri::command]
 fn clear_native_session_binding(state: State<AppState>, pane_id: String) -> Result<(), String> {
     let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
     if provider != "codex" && provider != "claude" && provider != "gemini" {
@@ -3811,6 +4366,8 @@ fn main() {
             run_provider_prompt,
             run_team_prompt,
             suggest_native_session_id,
+            list_native_session_candidates,
+            preview_native_session_messages,
             clear_native_session_binding,
             import_native_history,
             suggest_codex_session_id,
