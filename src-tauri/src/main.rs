@@ -26,6 +26,9 @@ struct PaneRuntime {
 struct AppState {
     panes: Mutex<HashMap<String, PaneRuntime>>,
     pane_runtime_starts: Mutex<HashMap<String, i64>>,
+    native_session_candidates_cache: Mutex<HashMap<String, NativeSessionCandidatesCache>>,
+    native_session_record_count_cache: Mutex<HashMap<String, NativeSessionRecordCountCache>>,
+    native_session_index_progress: Mutex<HashMap<String, NativeSessionIndexProgress>>,
     working_directory: Mutex<Option<PathBuf>>,
     app_config: Mutex<AppConfig>,
     config_path: PathBuf,
@@ -33,6 +36,40 @@ struct AppState {
     adapter_config_dir: PathBuf,
     log_path: PathBuf,
     log_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeSessionCandidatesCache {
+    updated_at: i64,
+    items: Vec<NativeSessionCandidate>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeSessionFileIndexRow {
+    session_id: String,
+    started_at: i64,
+    file_time_key: i64,
+    mtime: i64,
+    record_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct NativeSessionRecordCountCache {
+    updated_at: i64,
+    count: i64,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+struct NativeSessionIndexProgress {
+    provider: String,
+    running: bool,
+    total_files: i64,
+    processed_files: i64,
+    changed_files: i64,
+    started_at: i64,
+    elapsed_secs: i64,
+    last_duration_secs: i64,
+    updated_at: i64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -66,6 +103,7 @@ struct NativeImportResult {
     provider: String,
     pane_id: String,
     session_id: String,
+    session_ids: Vec<String>,
     source_dir: String,
     imported: i64,
     skipped: i64,
@@ -114,16 +152,27 @@ struct ObservabilityInfo {
     log_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct AppConfig {
     working_directory: Option<String>,
+    native_session_list_cache_ttl_secs: i64,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            working_directory: None,
+            native_session_list_cache_ttl_secs: DEFAULT_NATIVE_SESSION_CACHE_TTL_SECS,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct AppConfigResponse {
     config_path: String,
     working_directory: Option<String>,
+    native_session_list_cache_ttl_secs: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -138,12 +187,84 @@ struct TerminalExitEvent {
 }
 
 const IMPORT_FILE_QUIET_WINDOW_SECS: i64 = 2;
+const DEFAULT_NATIVE_SESSION_CACHE_TTL_SECS: i64 = 30;
+const MAX_NATIVE_SESSION_CACHE_TTL_SECS: i64 = 600;
 
 fn now_epoch() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn normalize_native_session_cache_ttl_secs(value: i64) -> i64 {
+    value.clamp(0, MAX_NATIVE_SESSION_CACHE_TTL_SECS)
+}
+
+fn set_native_session_index_progress(
+    state: &AppState,
+    provider: &str,
+    running: bool,
+    total_files: i64,
+    processed_files: i64,
+    changed_files: i64,
+) {
+    if let Ok(mut map) = state.native_session_index_progress.lock() {
+        let now = now_epoch();
+        let previous = map.get(provider).cloned();
+        let started_at = if running {
+            if let Some(prev) = previous.as_ref() {
+                if prev.running && prev.started_at > 0 {
+                    prev.started_at
+                } else {
+                    now
+                }
+            } else {
+                now
+            }
+        } else if let Some(prev) = previous.as_ref() {
+            if prev.running && prev.started_at > 0 {
+                prev.started_at
+            } else {
+                prev.started_at
+            }
+        } else {
+            0
+        };
+        let elapsed_secs = if started_at > 0 {
+            now.saturating_sub(started_at)
+        } else {
+            0
+        };
+        let last_duration_secs = if running {
+            previous
+                .as_ref()
+                .map(|item| item.last_duration_secs)
+                .unwrap_or(0)
+        } else if elapsed_secs > 0 {
+            elapsed_secs
+        } else {
+            previous
+                .as_ref()
+                .map(|item| item.last_duration_secs)
+                .unwrap_or(0)
+        };
+
+        map.insert(
+            provider.to_string(),
+            NativeSessionIndexProgress {
+                provider: provider.to_string(),
+                running,
+                total_files,
+                processed_files,
+                changed_files,
+                started_at,
+                elapsed_secs,
+                last_duration_secs,
+                updated_at: now,
+            },
+        );
+    }
 }
 
 fn should_wait_for_file_settle(mtime: i64) -> bool {
@@ -230,6 +351,21 @@ fn init_schema(path: &Path) -> Result<()> {
           session_id TEXT NOT NULL,
           updated_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS native_session_file_index (
+          provider TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          started_at INTEGER NOT NULL DEFAULT 0,
+          file_time_key INTEGER NOT NULL DEFAULT 0,
+          mtime INTEGER NOT NULL DEFAULT 0,
+          record_count INTEGER NOT NULL DEFAULT 0,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (provider, file_path)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_native_session_file_provider_session
+          ON native_session_file_index(provider, session_id);
         "#,
     )?;
 
@@ -257,6 +393,15 @@ fn save_app_config(path: &Path, config: &AppConfig) -> Result<()> {
     let payload = serde_json::to_string_pretty(config)?;
     fs::write(path, payload)?;
     Ok(())
+}
+
+fn session_cache_ttl_secs(state: &AppState) -> i64 {
+    state
+        .app_config
+        .lock()
+        .ok()
+        .map(|config| normalize_native_session_cache_ttl_secs(config.native_session_list_cache_ttl_secs))
+        .unwrap_or(DEFAULT_NATIVE_SESSION_CACHE_TTL_SECS)
 }
 
 #[derive(Debug, Clone)]
@@ -656,6 +801,14 @@ fn shell_command_builder(cwd: Option<&Path>) -> CommandBuilder {
         let mut builder = CommandBuilder::new("powershell");
         builder.arg("-NoLogo");
         builder.arg("-NoExit");
+        // Force UTF-8 in interactive PowerShell sessions to avoid mojibake.
+        builder.arg("-Command");
+        builder.arg(
+            "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new(); \
+             [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); \
+             $OutputEncoding=[Console]::OutputEncoding; \
+             chcp 65001 > $null",
+        );
         if let Some(path) = cwd {
             builder.cwd(path);
         }
@@ -1423,6 +1576,23 @@ fn normalize_session_id(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_session_id_list(values: Option<Vec<String>>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for value in values.unwrap_or_default() {
+        for token in value
+            .split(|ch| ch == '\n' || ch == '\r' || ch == ',' || ch == ';')
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+        {
+            if seen.insert(token.to_string()) {
+                normalized.push(token.to_string());
+            }
+        }
+    }
+    normalized
+}
+
 fn parse_rollout_file_time_key(path: &Path) -> i64 {
     let name = match path.file_name().and_then(|item| item.to_str()) {
         Some(value) => value,
@@ -1712,6 +1882,255 @@ fn collect_gemini_metas(root: &Path) -> Result<Vec<GeminiSessionMeta>> {
     Ok(metas)
 }
 
+fn parse_gemini_record_count(value: &serde_json::Value) -> i64 {
+    value
+        .get("messages")
+        .and_then(|item| item.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message.get("type").and_then(|item| item.as_str()),
+                        Some("user") | Some("assistant") | Some("gemini")
+                    )
+                })
+                .count() as i64
+        })
+        .unwrap_or(0)
+}
+
+fn extract_gemini_meta_with_count(path: &Path) -> Option<(String, i64, i64)> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+        let session_id = value
+            .get("sessionId")
+            .and_then(|item| item.as_str())
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())?;
+        let started_at = value
+            .get("startTime")
+            .and_then(|item| item.as_str())
+            .and_then(parse_rfc3339_epoch_seconds)
+            .unwrap_or_default();
+        let record_count = parse_gemini_record_count(&value);
+        return Some((session_id, started_at, record_count));
+    }
+
+    let session_id = extract_json_string_field(&raw, "sessionId")
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())?;
+    let started_at = extract_json_string_field(&raw, "startTime")
+        .and_then(|item| parse_rfc3339_epoch_seconds(&item))
+        .unwrap_or_default();
+    Some((session_id, started_at, 0))
+}
+
+fn load_native_session_file_index_rows(
+    connection: &Connection,
+    provider: &str,
+) -> Result<HashMap<String, NativeSessionFileIndexRow>> {
+    let mut map = HashMap::<String, NativeSessionFileIndexRow>::new();
+    let mut statement = connection.prepare(
+        r#"
+        SELECT file_path, session_id, started_at, file_time_key, mtime, record_count
+        FROM native_session_file_index
+        WHERE provider = ?1
+        "#,
+    )?;
+    let mut rows = statement.query(params![provider])?;
+    while let Some(row) = rows.next()? {
+        let file_path = row.get::<usize, String>(0)?;
+        map.insert(
+            file_path,
+            NativeSessionFileIndexRow {
+                session_id: row.get::<usize, String>(1)?,
+                started_at: row.get::<usize, i64>(2)?,
+                file_time_key: row.get::<usize, i64>(3)?,
+                mtime: row.get::<usize, i64>(4)?,
+                record_count: row.get::<usize, i64>(5)?,
+            },
+        );
+    }
+    Ok(map)
+}
+
+fn upsert_native_session_file_index_row(
+    connection: &Connection,
+    provider: &str,
+    file_path: &str,
+    row: &NativeSessionFileIndexRow,
+) -> Result<()> {
+    connection.execute(
+        r#"
+        INSERT INTO native_session_file_index
+          (provider, file_path, session_id, started_at, file_time_key, mtime, record_count, updated_at)
+        VALUES
+          (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(provider, file_path)
+        DO UPDATE SET
+          session_id = excluded.session_id,
+          started_at = excluded.started_at,
+          file_time_key = excluded.file_time_key,
+          mtime = excluded.mtime,
+          record_count = excluded.record_count,
+          updated_at = excluded.updated_at
+        "#,
+        params![
+            provider,
+            file_path,
+            row.session_id,
+            row.started_at,
+            row.file_time_key,
+            row.mtime,
+            row.record_count,
+            now_epoch()
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_native_session_file_index_row(connection: &Connection, provider: &str, file_path: &str) -> Result<()> {
+    connection.execute(
+        "DELETE FROM native_session_file_index WHERE provider = ?1 AND file_path = ?2",
+        params![provider, file_path],
+    )?;
+    Ok(())
+}
+
+fn collect_gemini_metas_indexed(state: &AppState, db_path: &Path, root: &Path) -> Result<Vec<GeminiSessionMeta>> {
+    let mut files = Vec::new();
+    collect_gemini_session_files(root, &mut files)?;
+    let total_files = files.len() as i64;
+    let mut processed_files = 0_i64;
+    let mut changed_files = 0_i64;
+    set_native_session_index_progress(state, "gemini", true, total_files, processed_files, changed_files);
+
+    let connection = match open_db(db_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            set_native_session_index_progress(
+                state,
+                "gemini",
+                false,
+                total_files,
+                processed_files,
+                changed_files,
+            );
+            return Err(error);
+        }
+    };
+    let mut indexed = match load_native_session_file_index_rows(&connection, "gemini") {
+        Ok(rows) => rows,
+        Err(error) => {
+            set_native_session_index_progress(
+                state,
+                "gemini",
+                false,
+                total_files,
+                processed_files,
+                changed_files,
+            );
+            return Err(error);
+        }
+    };
+    let mut seen_paths = HashSet::<String>::new();
+    let mut metas = Vec::new();
+
+    for file_path in files {
+        processed_files += 1;
+        let file_path_string = file_path.to_string_lossy().to_string();
+        seen_paths.insert(file_path_string.clone());
+        let mtime = file_mtime_epoch(&file_path);
+
+        if let Some(cached) = indexed.get(&file_path_string) {
+            if cached.mtime == mtime {
+                metas.push(GeminiSessionMeta {
+                    file_path,
+                    session_id: cached.session_id.clone(),
+                    started_at: cached.started_at,
+                    file_time_key: cached.file_time_key,
+                    mtime: cached.mtime,
+                });
+                if processed_files % 8 == 0 || processed_files >= total_files {
+                    set_native_session_index_progress(
+                        state,
+                        "gemini",
+                        true,
+                        total_files,
+                        processed_files,
+                        changed_files,
+                    );
+                }
+                continue;
+            }
+        }
+
+        if let Some((session_id, started_at, record_count)) = extract_gemini_meta_with_count(&file_path) {
+            let row = NativeSessionFileIndexRow {
+                session_id: session_id.clone(),
+                started_at,
+                file_time_key: parse_gemini_file_time_key(&file_path),
+                mtime,
+                record_count,
+            };
+            if let Err(error) =
+                upsert_native_session_file_index_row(&connection, "gemini", &file_path_string, &row)
+            {
+                set_native_session_index_progress(
+                    state,
+                    "gemini",
+                    false,
+                    total_files,
+                    processed_files,
+                    changed_files,
+                );
+                return Err(error);
+            }
+            indexed.insert(file_path_string.clone(), row.clone());
+            changed_files += 1;
+            metas.push(GeminiSessionMeta {
+                file_path,
+                session_id,
+                started_at,
+                file_time_key: row.file_time_key,
+                mtime: row.mtime,
+            });
+        } else {
+            let _ = delete_native_session_file_index_row(&connection, "gemini", &file_path_string);
+            if indexed.remove(&file_path_string).is_some() {
+                changed_files += 1;
+            }
+        }
+
+        if processed_files % 8 == 0 || processed_files >= total_files {
+            set_native_session_index_progress(
+                state,
+                "gemini",
+                true,
+                total_files,
+                processed_files,
+                changed_files,
+            );
+        }
+    }
+
+    for stale_path in indexed.keys().filter(|path| !seen_paths.contains(*path)).cloned().collect::<Vec<_>>() {
+        let _ = delete_native_session_file_index_row(&connection, "gemini", &stale_path);
+        changed_files += 1;
+    }
+
+    set_native_session_index_progress(
+        state,
+        "gemini",
+        false,
+        total_files,
+        processed_files,
+        changed_files,
+    );
+    Ok(metas)
+}
+
 fn clip_preview_content(value: &str, max_chars: usize) -> String {
     let sanitized = sanitize_log_text(value);
     let trimmed = sanitized.trim();
@@ -1809,7 +2228,10 @@ fn sort_session_candidates(items: &mut Vec<NativeSessionCandidate>) {
     });
 }
 
-fn list_native_session_candidates_for_provider(provider: &str) -> Result<Vec<NativeSessionCandidate>> {
+fn list_native_session_candidates_for_provider(
+    state: &AppState,
+    provider: &str,
+) -> Result<Vec<NativeSessionCandidate>> {
     let mut map = HashMap::<String, NativeSessionCandidate>::new();
     match provider {
         "codex" => {
@@ -1850,7 +2272,7 @@ fn list_native_session_candidates_for_provider(provider: &str) -> Result<Vec<Nat
             if !sessions_root.exists() {
                 return Ok(Vec::new());
             }
-            let metas = collect_gemini_metas(&sessions_root)?;
+            let metas = collect_gemini_metas_indexed(state, &state.db_path, &sessions_root)?;
             for meta in metas {
                 merge_session_candidate(
                     &mut map,
@@ -2109,6 +2531,125 @@ fn count_native_session_records_for_provider(provider: &str, session_id: &str) -
         .unwrap_or(0)
 }
 
+fn load_native_session_candidates_cached(
+    state: &AppState,
+    provider: &str,
+    ttl_secs: i64,
+) -> Result<Vec<NativeSessionCandidate>, String> {
+    if ttl_secs <= 0 {
+        return list_native_session_candidates_for_provider(state, provider)
+            .map_err(|error| error.to_string());
+    }
+
+    let now = now_epoch();
+    if let Ok(cache) = state.native_session_candidates_cache.lock() {
+        if let Some(hit) = cache.get(provider) {
+            if now.saturating_sub(hit.updated_at) <= ttl_secs {
+                return Ok(hit.items.clone());
+            }
+        }
+    }
+
+    let items = list_native_session_candidates_for_provider(state, provider)
+        .map_err(|error| error.to_string())?;
+    if let Ok(mut cache) = state.native_session_candidates_cache.lock() {
+        cache.insert(
+            provider.to_string(),
+            NativeSessionCandidatesCache {
+                updated_at: now,
+                items: items.clone(),
+            },
+        );
+    }
+    Ok(items)
+}
+
+fn load_native_session_record_count_cached(
+    state: &AppState,
+    provider: &str,
+    session_id: &str,
+    ttl_secs: i64,
+) -> i64 {
+    if ttl_secs <= 0 {
+        return count_native_session_records_for_provider(provider, session_id);
+    }
+
+    let now = now_epoch();
+    let key = format!("{}::{}", provider, session_id);
+    if let Ok(cache) = state.native_session_record_count_cache.lock() {
+        if let Some(hit) = cache.get(&key) {
+            if now.saturating_sub(hit.updated_at) <= ttl_secs {
+                return hit.count;
+            }
+        }
+    }
+
+    let indexed_count = if provider == "gemini" {
+        open_db(&state.db_path)
+            .and_then(|connection| {
+                connection.query_row(
+                    r#"
+                    SELECT COUNT(1), COALESCE(SUM(record_count), 0)
+                    FROM native_session_file_index
+                    WHERE provider = ?1 AND session_id = ?2
+                    "#,
+                    params![provider, session_id],
+                    |row| {
+                        let rows = row.get::<usize, i64>(0)?;
+                        let sum = row.get::<usize, i64>(1)?;
+                        Ok((rows, sum))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .ok()
+            .and_then(|(rows, sum)| if rows > 0 { Some(sum) } else { None })
+    } else {
+        None
+    };
+
+    let count = indexed_count.unwrap_or_else(|| count_native_session_records_for_provider(provider, session_id));
+    if let Ok(mut cache) = state.native_session_record_count_cache.lock() {
+        cache.insert(
+            key,
+            NativeSessionRecordCountCache {
+                updated_at: now,
+                count,
+            },
+        );
+    }
+    count
+}
+
+fn invalidate_native_session_record_count_cache(
+    state: &AppState,
+    provider: &str,
+    session_ids: &[String],
+) {
+    let mut keys = HashSet::new();
+    for session_id in session_ids {
+        let normalized = session_id.trim();
+        if normalized.is_empty() {
+            continue;
+        }
+        keys.insert(format!("{}::{}", provider, normalized));
+    }
+    if keys.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = state.native_session_record_count_cache.lock() {
+        for key in keys {
+            cache.remove(&key);
+        }
+    }
+}
+
+fn invalidate_native_session_candidates_cache(state: &AppState, provider: &str) {
+    if let Ok(mut cache) = state.native_session_candidates_cache.lock() {
+        cache.remove(provider);
+    }
+}
+
 fn save_bound_session_id(connection: &Connection, pane_id: &str, session_id: &str) -> Result<()> {
     connection.execute(
         r#"
@@ -2335,6 +2876,7 @@ fn import_codex_native_history_db(
         provider: "codex".to_string(),
         pane_id: pane_id.to_string(),
         session_id: target_session_id.clone(),
+        session_ids: vec![target_session_id.clone()],
         source_dir: sessions_dir.to_string_lossy().to_string(),
         imported: 0,
         skipped: 0,
@@ -2529,6 +3071,7 @@ fn import_claude_native_history_db(
         provider: "claude".to_string(),
         pane_id: pane_id.to_string(),
         session_id: target_session_id.clone(),
+        session_ids: vec![target_session_id.clone()],
         source_dir: projects_dir.to_string_lossy().to_string(),
         imported: 0,
         skipped: 0,
@@ -2700,6 +3243,7 @@ fn import_gemini_native_history_db(
         provider: "gemini".to_string(),
         pane_id: pane_id.to_string(),
         session_id: target_session_id.clone(),
+        session_ids: vec![target_session_id.clone()],
         source_dir: sessions_root.to_string_lossy().to_string(),
         imported: 0,
         skipped: 0,
@@ -3721,12 +4265,16 @@ fn list_native_session_candidates(
     pane_id: String,
     offset: Option<i64>,
     limit: Option<i64>,
+    time_from: Option<i64>,
+    time_to: Option<i64>,
+    records_min: Option<i64>,
+    records_max: Option<i64>,
     sort_by: Option<String>,
     sort_order: Option<String>,
 ) -> Result<NativeSessionListResponse, String> {
     let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
-    let mut all_items =
-        list_native_session_candidates_for_provider(&provider).map_err(|error| error.to_string())?;
+    let cache_ttl_secs = session_cache_ttl_secs(&state);
+    let mut all_items = load_native_session_candidates_cached(&state, &provider, cache_ttl_secs)?;
 
     let normalized_sort_by = sort_by
         .unwrap_or_else(|| "time".to_string())
@@ -3738,11 +4286,76 @@ fn list_native_session_candidates(
         .trim()
         .to_lowercase();
     let desc = normalized_sort_order != "asc";
+    let mut time_from_value = time_from.filter(|value| *value > 0);
+    let mut time_to_value = time_to.filter(|value| *value > 0);
+    if let (Some(from), Some(to)) = (time_from_value, time_to_value) {
+        if from > to {
+            time_from_value = Some(to);
+            time_to_value = Some(from);
+        }
+    }
+    let mut records_min_value = records_min.map(|value| value.max(0));
+    let mut records_max_value = records_max.map(|value| value.max(0));
+    if let (Some(minimum), Some(maximum)) = (records_min_value, records_max_value) {
+        if minimum > maximum {
+            records_min_value = Some(maximum);
+            records_max_value = Some(minimum);
+        }
+    }
+    let filter_by_records = records_min_value.is_some() || records_max_value.is_some();
+    let need_record_count = sort_by_records || filter_by_records;
+
+    if need_record_count {
+        for item in &mut all_items {
+            item.record_count =
+                load_native_session_record_count_cached(&state, &provider, &item.session_id, cache_ttl_secs);
+        }
+    }
+
+    if time_from_value.is_some() || time_to_value.is_some() {
+        all_items = all_items
+            .into_iter()
+            .filter(|item| {
+                let candidate_time = if item.started_at > 0 {
+                    item.started_at
+                } else {
+                    item.last_seen_at
+                };
+                if let Some(from) = time_from_value {
+                    if candidate_time < from {
+                        return false;
+                    }
+                }
+                if let Some(to) = time_to_value {
+                    if candidate_time > to {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect::<Vec<_>>();
+    }
+
+    if filter_by_records {
+        all_items = all_items
+            .into_iter()
+            .filter(|item| {
+                if let Some(minimum) = records_min_value {
+                    if item.record_count < minimum {
+                        return false;
+                    }
+                }
+                if let Some(maximum) = records_max_value {
+                    if item.record_count > maximum {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect::<Vec<_>>();
+    }
 
     if sort_by_records {
-        for item in &mut all_items {
-            item.record_count = count_native_session_records_for_provider(&provider, &item.session_id);
-        }
         all_items.sort_by(|a, b| {
             let ord = a
                 .record_count
@@ -3788,9 +4401,10 @@ fn list_native_session_candidates(
         .skip(page_offset)
         .take(page_limit)
         .collect::<Vec<_>>();
-    if !sort_by_records {
+    if !need_record_count {
         for item in &mut items {
-            item.record_count = count_native_session_records_for_provider(&provider, &item.session_id);
+            item.record_count =
+                load_native_session_record_count_cached(&state, &provider, &item.session_id, cache_ttl_secs);
         }
     }
     let has_more = page_offset.saturating_add(items.len()) < total;
@@ -3802,6 +4416,31 @@ fn list_native_session_candidates(
         limit: page_limit as i64,
         has_more,
     })
+}
+
+#[tauri::command]
+fn get_native_session_index_progress(
+    state: State<AppState>,
+    pane_id: String,
+) -> Result<NativeSessionIndexProgress, String> {
+    let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
+    if provider != "gemini" {
+        return Ok(NativeSessionIndexProgress {
+            provider,
+            ..NativeSessionIndexProgress::default()
+        });
+    }
+    let progress = state
+        .native_session_index_progress
+        .lock()
+        .map_err(|_| "failed to lock native session index progress".to_string())?
+        .get("gemini")
+        .cloned()
+        .unwrap_or(NativeSessionIndexProgress {
+            provider: "gemini".to_string(),
+            ..NativeSessionIndexProgress::default()
+        });
+    Ok(progress)
 }
 
 #[tauri::command]
@@ -3857,6 +4496,7 @@ fn import_native_history(
     state: State<AppState>,
     pane_id: String,
     session_id: Option<String>,
+    session_ids: Option<Vec<String>>,
 ) -> Result<NativeImportResult, String> {
     let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
     let runtime_start = state
@@ -3865,7 +4505,51 @@ fn import_native_history(
         .map_err(|_| "failed to lock pane runtime start map".to_string())?
         .get(&pane_id)
         .copied();
-    import_native_history_inner(&state, &pane_id, &provider, session_id, runtime_start)
+    let mut requested_ids = normalize_session_id_list(session_ids);
+    if requested_ids.is_empty() {
+        if let Some(single) = normalize_session_id(session_id.clone()) {
+            requested_ids.push(single);
+        }
+    }
+
+    if requested_ids.is_empty() {
+        let result = import_native_history_inner(&state, &pane_id, &provider, None, runtime_start)?;
+        invalidate_native_session_candidates_cache(&state, &provider);
+        invalidate_native_session_record_count_cache(&state, &provider, &result.session_ids);
+        return Ok(result);
+    }
+
+    let mut aggregate: Option<NativeImportResult> = None;
+    for session in requested_ids {
+        let result = import_native_history_inner(
+            &state,
+            &pane_id,
+            &provider,
+            Some(session.clone()),
+            runtime_start,
+        )?;
+        invalidate_native_session_candidates_cache(&state, &provider);
+        invalidate_native_session_record_count_cache(&state, &provider, &result.session_ids);
+        if let Some(current) = aggregate.as_mut() {
+            current.session_id = result.session_id.clone();
+            current.session_ids.extend(result.session_ids.clone());
+            current.imported += result.imported;
+            current.skipped += result.skipped;
+            current.scanned_files += result.scanned_files;
+            current.scanned_lines += result.scanned_lines;
+            current.parse_errors += result.parse_errors;
+        } else {
+            aggregate = Some(result);
+        }
+    }
+
+    let mut merged = aggregate.ok_or_else(|| "no session ids to import".to_string())?;
+    merged.session_ids = normalize_session_id_list(Some(merged.session_ids.clone()));
+    if merged.session_id.trim().is_empty() {
+        merged.session_id = merged.session_ids.first().cloned().unwrap_or_default();
+    }
+
+    Ok(merged)
 }
 
 #[tauri::command]
@@ -3953,6 +4637,9 @@ fn get_app_config(state: State<AppState>) -> Result<AppConfigResponse, String> {
     Ok(AppConfigResponse {
         config_path: state.config_path.to_string_lossy().to_string(),
         working_directory: config.working_directory,
+        native_session_list_cache_ttl_secs: normalize_native_session_cache_ttl_secs(
+            config.native_session_list_cache_ttl_secs,
+        ),
     })
 }
 
@@ -3987,6 +4674,29 @@ fn set_working_directory(
     }
 
     Ok(normalized.map(|item| item.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn set_native_session_list_cache_ttl_secs(
+    state: State<AppState>,
+    ttl_secs: i64,
+) -> Result<i64, String> {
+    let normalized = normalize_native_session_cache_ttl_secs(ttl_secs);
+    {
+        let mut config = state
+            .app_config
+            .lock()
+            .map_err(|_| "failed to lock app config".to_string())?;
+        config.native_session_list_cache_ttl_secs = normalized;
+        save_app_config(&state.config_path, &config).map_err(|error| error.to_string())?;
+    }
+    if let Ok(mut cache) = state.native_session_candidates_cache.lock() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = state.native_session_record_count_cache.lock() {
+        cache.clear();
+    }
+    Ok(normalized)
 }
 
 #[tauri::command]
@@ -4325,7 +5035,9 @@ fn main() {
             let config_path = data_dir.join("settings.json");
             ensure_adapter_sample_file(&adapter_config_dir);
             init_schema(&db_path)?;
-            let app_config = load_app_config(&config_path);
+            let mut app_config = load_app_config(&config_path);
+            app_config.native_session_list_cache_ttl_secs =
+                normalize_native_session_cache_ttl_secs(app_config.native_session_list_cache_ttl_secs);
             let working_directory = normalize_working_directory(app_config.working_directory.clone())
                 .unwrap_or_default();
 
@@ -4342,6 +5054,9 @@ fn main() {
             app.manage(AppState {
                 panes: Mutex::new(HashMap::new()),
                 pane_runtime_starts: Mutex::new(HashMap::new()),
+                native_session_candidates_cache: Mutex::new(HashMap::new()),
+                native_session_record_count_cache: Mutex::new(HashMap::new()),
+                native_session_index_progress: Mutex::new(HashMap::new()),
                 working_directory: Mutex::new(working_directory),
                 app_config: Mutex::new(app_config),
                 config_path,
@@ -4367,6 +5082,7 @@ fn main() {
             run_team_prompt,
             suggest_native_session_id,
             list_native_session_candidates,
+            get_native_session_index_progress,
             preview_native_session_messages,
             clear_native_session_binding,
             import_native_history,
@@ -4380,6 +5096,7 @@ fn main() {
             get_observability_info,
             get_app_config,
             set_working_directory,
+            set_native_session_list_cache_ttl_secs,
             clear_all_history,
             clear_pane_history
         ])

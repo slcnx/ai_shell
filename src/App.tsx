@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -37,6 +37,7 @@ type NativeImportResult = {
   provider: string;
   pane_id: string;
   session_id: string;
+  session_ids: string[];
   source_dir: string;
   imported: number;
   skipped: number;
@@ -52,6 +53,7 @@ type ObservabilityInfo = {
 type AppConfigResponse = {
   config_path: string;
   working_directory: string | null;
+  native_session_list_cache_ttl_secs: number;
 };
 
 type NativeSessionCandidate = {
@@ -71,6 +73,11 @@ type NativeSessionListResponse = {
   has_more: boolean;
 };
 
+type SessionPickerListCacheEntry = {
+  loaded_at_ms: number;
+  items: NativeSessionCandidate[];
+};
+
 type NativeSessionPreviewRow = {
   kind: string;
   content: string;
@@ -83,6 +90,18 @@ type NativeSessionPreviewResponse = {
   total_rows: number;
   loaded_rows: number;
   has_more: boolean;
+};
+
+type NativeSessionIndexProgress = {
+  provider: string;
+  running: boolean;
+  total_files: number;
+  processed_files: number;
+  changed_files: number;
+  started_at: number;
+  elapsed_secs: number;
+  last_duration_secs: number;
+  updated_at: number;
 };
 
 type SyncQuickPreset = "turn-1" | "turn-3" | "turn-5" | "latest-qa" | "all";
@@ -148,8 +167,10 @@ const AUTO_IMPORT_INTERVAL_MS = 10000;
 const AUTO_IMPORT_BREAKER_THRESHOLD = 3;
 const IMPORT_FILE_QUIET_WINDOW_SECONDS = 2;
 const SID_HIGHLIGHT_MS = 1400;
+const SESSION_PICKER_INITIAL_PAGE_SIZE = 24;
 const SESSION_PICKER_PAGE_SIZE = 60;
 const SESSION_PREVIEW_PAGE = 200;
+const SESSION_INDEX_PROGRESS_POLL_MS = 450;
 
 type SyncComposeResult = {
   originalPayload: string;
@@ -329,6 +350,38 @@ function shortSessionId(sessionId: string): string {
   return `${normalized.slice(0, 8)}...${normalized.slice(-6)}`;
 }
 
+function parseSessionIdList(value: string): string[] {
+  const seen = new Set<string>();
+  const items: string[] = [];
+  for (const raw of value.split(/[\n\r,;\s]+/)) {
+    const sid = raw.trim();
+    if (!sid || seen.has(sid)) {
+      continue;
+    }
+    seen.add(sid);
+    items.push(sid);
+  }
+  return items;
+}
+
+function formatSessionIdList(sessionIds: string[], separator = ", "): string {
+  return sessionIds.join(separator);
+}
+
+function mergeSessionIdLists(primary: string[], secondary: string[]): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const sid of [...primary, ...secondary]) {
+    const normalized = sid.trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    merged.push(normalized);
+  }
+  return merged;
+}
+
 function sessionSortArgs(mode: SessionPickerSortMode): { sortBy: "time" | "records"; sortOrder: "asc" | "desc" } {
   if (mode === "time_asc") {
     return { sortBy: "time", sortOrder: "asc" };
@@ -340,6 +393,102 @@ function sessionSortArgs(mode: SessionPickerSortMode): { sortBy: "time" | "recor
     return { sortBy: "records", sortOrder: "asc" };
   }
   return { sortBy: "time", sortOrder: "desc" };
+}
+
+function sortSessionCandidates(
+  items: NativeSessionCandidate[],
+  mode: SessionPickerSortMode
+): NativeSessionCandidate[] {
+  const sorted = [...items];
+  if (mode === "records_desc" || mode === "records_asc") {
+    sorted.sort((a, b) => {
+      const ord =
+        a.record_count - b.record_count ||
+        a.started_at - b.started_at ||
+        a.last_seen_at - b.last_seen_at ||
+        a.session_id.localeCompare(b.session_id);
+      return mode === "records_desc" ? -ord : ord;
+    });
+    return sorted;
+  }
+
+  sorted.sort((a, b) => {
+    const aTime = a.started_at > 0 ? a.started_at : a.last_seen_at;
+    const bTime = b.started_at > 0 ? b.started_at : b.last_seen_at;
+    const ord = aTime - bTime || a.last_seen_at - b.last_seen_at || a.session_id.localeCompare(b.session_id);
+    return mode === "time_desc" ? -ord : ord;
+  });
+  return sorted;
+}
+
+type SessionFilterQuery = {
+  timeFrom: number | null;
+  timeTo: number | null;
+  recordsMin: number | null;
+  recordsMax: number | null;
+};
+
+function parseDateTimeLocalToEpoch(value: string): number | null {
+  const normalized = value.trim();
+  if (!normalized) {
+    return null;
+  }
+  const timestamp = new Date(normalized).getTime();
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return null;
+  }
+  return Math.floor(timestamp / 1000);
+}
+
+function parseSessionFilterQuery(
+  timeFromText: string,
+  timeToText: string,
+  recordsMinText: string,
+  recordsMaxText: string
+): SessionFilterQuery {
+  let timeFrom = parseDateTimeLocalToEpoch(timeFromText);
+  let timeTo = parseDateTimeLocalToEpoch(timeToText);
+  if (timeFrom !== null && timeTo !== null && timeFrom > timeTo) {
+    const swap = timeFrom;
+    timeFrom = timeTo;
+    timeTo = swap;
+  }
+
+  const parseRecord = (raw: string): number | null => {
+    const normalized = raw.trim();
+    if (!normalized) {
+      return null;
+    }
+    const value = Number(normalized);
+    if (!Number.isFinite(value)) {
+      return null;
+    }
+    return Math.max(0, Math.floor(value));
+  };
+
+  let recordsMin = parseRecord(recordsMinText);
+  let recordsMax = parseRecord(recordsMaxText);
+  if (recordsMin !== null && recordsMax !== null && recordsMin > recordsMax) {
+    const swap = recordsMin;
+    recordsMin = recordsMax;
+    recordsMax = swap;
+  }
+
+  return {
+    timeFrom,
+    timeTo,
+    recordsMin,
+    recordsMax
+  };
+}
+
+function sessionFilterCacheKey(query: SessionFilterQuery): string {
+  const key = [query.timeFrom ?? "", query.timeTo ?? "", query.recordsMin ?? "", query.recordsMax ?? ""];
+  return key.join("|");
+}
+
+function sessionPickerCacheKey(paneId: string, query: SessionFilterQuery): string {
+  return `${paneId}::${sessionFilterCacheKey(query)}`;
 }
 
 function nativeSourceHint(provider: string): string {
@@ -828,17 +977,25 @@ function App() {
   const [configPath, setConfigPath] = useState<string>("");
   const [showConfigMenu, setShowConfigMenu] = useState(false);
   const [applyingWorkingDirectory, setApplyingWorkingDirectory] = useState(false);
+  const [sessionListCacheTtlSecs, setSessionListCacheTtlSecs] = useState<number>(30);
+  const [savingSessionListCacheTtl, setSavingSessionListCacheTtl] = useState(false);
   const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
   const [sessionPickerPaneId, setSessionPickerPaneId] = useState("");
   const [sessionPickerProvider, setSessionPickerProvider] = useState("");
   const [sessionPickerSortMode, setSessionPickerSortMode] = useState<SessionPickerSortMode>("time_desc");
+  const [sessionPickerTimeFrom, setSessionPickerTimeFrom] = useState("");
+  const [sessionPickerTimeTo, setSessionPickerTimeTo] = useState("");
+  const [sessionPickerRecordsMin, setSessionPickerRecordsMin] = useState("");
+  const [sessionPickerRecordsMax, setSessionPickerRecordsMax] = useState("");
   const [sessionPickerItems, setSessionPickerItems] = useState<NativeSessionCandidate[]>([]);
   const [sessionPickerTotal, setSessionPickerTotal] = useState(0);
   const [sessionPickerHasMore, setSessionPickerHasMore] = useState(false);
   const [sessionPickerLoading, setSessionPickerLoading] = useState(false);
   const [sessionPickerLoadingMore, setSessionPickerLoadingMore] = useState(false);
+  const [sessionPickerAutoLoading, setSessionPickerAutoLoading] = useState(false);
   const [sessionPickerError, setSessionPickerError] = useState("");
   const [sessionPickerSelectedSid, setSessionPickerSelectedSid] = useState("");
+  const [sessionPickerCheckedSids, setSessionPickerCheckedSids] = useState<string[]>([]);
   const [sessionPickerManualSid, setSessionPickerManualSid] = useState("");
   const [sessionPickerPreviewRows, setSessionPickerPreviewRows] = useState<NativeSessionPreviewRow[]>([]);
   const [sessionPickerPreviewLimit, setSessionPickerPreviewLimit] = useState(SESSION_PREVIEW_PAGE);
@@ -846,11 +1003,49 @@ function App() {
   const [sessionPickerPreviewHasMore, setSessionPickerPreviewHasMore] = useState(false);
   const [sessionPickerPreviewLoading, setSessionPickerPreviewLoading] = useState(false);
   const [sessionPickerPreviewError, setSessionPickerPreviewError] = useState("");
+  const [sessionPickerIndexProgress, setSessionPickerIndexProgress] =
+    useState<NativeSessionIndexProgress | null>(null);
   const terminalsRef = useRef<Map<string, PaneTerminal>>(new Map());
   const sessionPickerListTicketRef = useRef(0);
   const sessionPickerPreviewTicketRef = useRef(0);
+  const sessionPickerListCacheRef = useRef<Map<string, SessionPickerListCacheEntry>>(new Map());
 
   const paneIds = useMemo(() => panes.map((pane) => pane.id), [panes]);
+  const sessionPickerFilterActive = Boolean(
+    sessionPickerTimeFrom.trim() ||
+      sessionPickerTimeTo.trim() ||
+      sessionPickerRecordsMin.trim() ||
+      sessionPickerRecordsMax.trim()
+  );
+  const sessionPickerMergedSids = useMemo(
+    () => mergeSessionIdLists(parseSessionIdList(sessionPickerManualSid), sessionPickerCheckedSids),
+    [sessionPickerManualSid, sessionPickerCheckedSids]
+  );
+  const sessionPickerLoadPercent = useMemo(() => {
+    if (sessionPickerTotal <= 0) {
+      return 0;
+    }
+    return clamp(Math.round((sessionPickerItems.length / sessionPickerTotal) * 100), 0, 100);
+  }, [sessionPickerItems.length, sessionPickerTotal]);
+  const sessionPickerIndexNote = useMemo(() => {
+    if (sessionPickerProvider !== "gemini" || !sessionPickerIndexProgress) {
+      return "";
+    }
+    const total = Math.max(0, sessionPickerIndexProgress.total_files);
+    const rawProcessed = Math.max(0, sessionPickerIndexProgress.processed_files);
+    const processed = total > 0 ? clamp(rawProcessed, 0, total) : rawProcessed;
+    const changed = Math.max(0, sessionPickerIndexProgress.changed_files);
+    const elapsed = Math.max(0, sessionPickerIndexProgress.elapsed_secs);
+    const lastDuration = Math.max(0, sessionPickerIndexProgress.last_duration_secs);
+    if (sessionPickerIndexProgress.running) {
+      return `索引进度 ${processed}/${total}（变更 ${changed}，已耗时 ${elapsed}s）`;
+    }
+    if (total > 0 || changed > 0) {
+      const durationText = lastDuration > 0 ? `，耗时 ${lastDuration}s` : "";
+      return `索引完成 ${processed}/${total}（变更 ${changed}${durationText}）`;
+    }
+    return "索引就绪";
+  }, [sessionPickerProvider, sessionPickerIndexProgress]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -879,6 +1074,12 @@ function App() {
     syncSummaryChars,
     showFlowMap
   ]);
+
+  useEffect(() => {
+    if (sessionListCacheTtlSecs <= 0) {
+      sessionPickerListCacheRef.current.clear();
+    }
+  }, [sessionListCacheTtlSecs]);
 
   const markPipelineEdge = useCallback(
     (edgeId: PipelineEdgeId, status: PipelineStatus, note: string) => {
@@ -960,6 +1161,39 @@ function App() {
     }
   };
 
+  const saveSessionListCacheTtl = async (silent?: boolean) => {
+    if (savingSessionListCacheTtl) {
+      return;
+    }
+    const normalized = clamp(Number(sessionListCacheTtlSecs || 0), 0, 600);
+    setSavingSessionListCacheTtl(true);
+    try {
+      const applied = await invoke<number>("set_native_session_list_cache_ttl_secs", {
+        ttlSecs: normalized
+      });
+      const finalValue = clamp(Number(applied || 0), 0, 600);
+      setSessionListCacheTtlSecs(finalValue);
+      if (finalValue <= 0) {
+        sessionPickerListCacheRef.current.clear();
+      }
+      if (!silent) {
+        window.alert(
+          finalValue > 0
+            ? `会话列表缓存已设置为 ${finalValue} 秒。`
+            : "会话列表缓存已关闭（每次实时扫描）。"
+        );
+      }
+    } catch (error) {
+      console.error(error);
+      if (!silent) {
+        const detail = error instanceof Error ? error.message : String(error);
+        window.alert(`保存会话缓存配置失败：${detail}`);
+      }
+    } finally {
+      setSavingSessionListCacheTtl(false);
+    }
+  };
+
   const hydratePaneHistory = useCallback(async (paneId: string) => {
     try {
       const [entries, totalRecords] = await Promise.all([
@@ -1034,7 +1268,10 @@ function App() {
       const term = new Terminal({
         convertEol: true,
         cursorBlink: true,
-        fontFamily: "Consolas, 'Cascadia Mono', monospace",
+        fontFamily:
+          "'Cascadia Mono', Consolas, 'JetBrains Mono', Menlo, Monaco, " +
+          "'Noto Sans Mono CJK SC', 'Source Han Mono SC', 'PingFang SC', " +
+          "'Microsoft YaHei UI', monospace",
         fontSize: 14,
         lineHeight: 1.28,
         theme: {
@@ -1101,6 +1338,9 @@ function App() {
         if (!disposed && appConfig) {
           setConfigPath(appConfig.config_path);
           setWorkingDirectory((appConfig.working_directory ?? "").trim());
+          setSessionListCacheTtlSecs(
+            clamp(Number(appConfig.native_session_list_cache_ttl_secs || 30), 0, 600)
+          );
         }
 
         const providers = await invoke<string[]>("list_registered_providers")
@@ -1230,6 +1470,52 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [sessionPickerOpen]);
 
+  useEffect(() => {
+    if (!sessionPickerOpen || !sessionPickerPaneId || sessionPickerProvider !== "gemini") {
+      setSessionPickerIndexProgress(null);
+      return;
+    }
+    if (!sessionPickerLoading && !sessionPickerAutoLoading) {
+      return;
+    }
+
+    let stopped = false;
+    let timer: number | null = null;
+
+    const tick = async () => {
+      try {
+        const progress = await invoke<NativeSessionIndexProgress>("get_native_session_index_progress", {
+          paneId: sessionPickerPaneId
+        });
+        if (!stopped) {
+          setSessionPickerIndexProgress(progress);
+        }
+      } catch (error) {
+        if (!stopped) {
+          console.error(error);
+        }
+      } finally {
+        if (!stopped && (sessionPickerLoading || sessionPickerAutoLoading)) {
+          timer = window.setTimeout(tick, SESSION_INDEX_PROGRESS_POLL_MS);
+        }
+      }
+    };
+
+    void tick();
+    return () => {
+      stopped = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [
+    sessionPickerOpen,
+    sessionPickerPaneId,
+    sessionPickerProvider,
+    sessionPickerLoading,
+    sessionPickerAutoLoading
+  ]);
+
   const addPane = async (provider: Provider) => {
     const summary = await invoke<PaneSummary>("create_pane", {
       provider,
@@ -1292,6 +1578,8 @@ function App() {
   const closeSessionPicker = () => {
     sessionPickerListTicketRef.current += 1;
     sessionPickerPreviewTicketRef.current += 1;
+    setSessionPickerAutoLoading(false);
+    setSessionPickerIndexProgress(null);
     setSessionPickerOpen(false);
   };
 
@@ -1356,34 +1644,158 @@ function App() {
     }
   };
 
-  const openSessionPicker = async (paneId: string, sortModeOverride?: SessionPickerSortMode) => {
+  const autoLoadRemainingSessionCandidates = async (
+    paneId: string,
+    ticket: number,
+    sortMode: SessionPickerSortMode,
+    filterQuery: SessionFilterQuery,
+    startOffset: number,
+    initialItems: NativeSessionCandidate[],
+    cacheKey: string
+  ) => {
+    let offset = startOffset;
+    const sortArgs = sessionSortArgs(sortMode);
+    let mergedItems = [...initialItems];
+    setSessionPickerAutoLoading(true);
+    setSessionPickerError("");
+
+    try {
+      while (sessionPickerListTicketRef.current === ticket) {
+        const response = await invoke<NativeSessionListResponse>("list_native_session_candidates", {
+          paneId,
+          offset,
+          limit: SESSION_PICKER_PAGE_SIZE,
+          timeFrom: filterQuery.timeFrom,
+          timeTo: filterQuery.timeTo,
+          recordsMin: filterQuery.recordsMin,
+          recordsMax: filterQuery.recordsMax,
+          sortBy: sortArgs.sortBy,
+          sortOrder: sortArgs.sortOrder
+        });
+        if (sessionPickerListTicketRef.current !== ticket) {
+          return;
+        }
+        const seen = new Set(mergedItems.map((item) => item.session_id));
+        const appended = response.items.filter((item) => !seen.has(item.session_id));
+        if (appended.length > 0) {
+          mergedItems = [...mergedItems, ...appended];
+          setSessionPickerItems(mergedItems);
+        }
+        setSessionPickerTotal(response.total);
+        setSessionPickerHasMore(response.has_more);
+
+        offset += response.items.length;
+        if (!response.has_more || response.items.length === 0) {
+          sessionPickerListCacheRef.current.set(cacheKey, {
+            loaded_at_ms: Date.now(),
+            items: mergedItems
+          });
+          break;
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      }
+    } catch (error) {
+      if (sessionPickerListTicketRef.current !== ticket) {
+        return;
+      }
+      console.error(error);
+      const detail = error instanceof Error ? error.message : String(error);
+      setSessionPickerError(detail);
+    } finally {
+      if (sessionPickerListTicketRef.current === ticket) {
+        setSessionPickerAutoLoading(false);
+      }
+    }
+  };
+
+  const openSessionPicker = async (
+    paneId: string,
+    sortModeOverride?: SessionPickerSortMode,
+    filterOverride?: SessionFilterQuery
+  ) => {
     const pane = panes.find((item) => item.id === paneId);
     if (!pane) {
       return;
     }
     const sortMode = sortModeOverride ?? sessionPickerSortMode;
     const sortArgs = sessionSortArgs(sortMode);
-    const preferredSid = pane.native_session_id.trim();
+    const filterQuery =
+      filterOverride ??
+      parseSessionFilterQuery(
+        sessionPickerTimeFrom,
+        sessionPickerTimeTo,
+        sessionPickerRecordsMin,
+        sessionPickerRecordsMax
+      );
+    const cacheKey = sessionPickerCacheKey(paneId, filterQuery);
+    const keepPickerState = sessionPickerOpen && sessionPickerPaneId === paneId;
+    const preferredSids = parseSessionIdList(pane.native_session_id);
+    const preferredSid = preferredSids[0] ?? sessionPickerSelectedSid.trim();
     setSessionPickerOpen(true);
     setSessionPickerPaneId(paneId);
     setSessionPickerProvider(pane.provider);
+    setSessionPickerIndexProgress(null);
     if (sortModeOverride) {
       setSessionPickerSortMode(sortModeOverride);
     }
+
+    const ttlMs = Math.max(0, sessionListCacheTtlSecs) * 1000;
+    const cached = sessionPickerListCacheRef.current.get(cacheKey);
+    const cacheValid =
+      Boolean(cached) &&
+      (ttlMs > 0 ? Date.now() - (cached?.loaded_at_ms ?? 0) <= ttlMs : false);
+    if (cacheValid && cached) {
+      const sorted = sortSessionCandidates(cached.items, sortMode);
+      const available = new Set(sorted.map((item) => item.session_id));
+      const selected =
+        preferredSids.find((sid) => available.has(sid)) ||
+        (keepPickerState && available.has(sessionPickerSelectedSid) ? sessionPickerSelectedSid : "") ||
+        sorted[0]?.session_id ||
+        preferredSid;
+      setSessionPickerItems(sorted);
+      setSessionPickerTotal(sorted.length);
+      setSessionPickerHasMore(false);
+      setSessionPickerError("");
+      setSessionPickerLoading(false);
+      setSessionPickerLoadingMore(false);
+      setSessionPickerAutoLoading(false);
+      setSessionPickerSelectedSid(selected);
+      if (!keepPickerState) {
+        setSessionPickerCheckedSids([]);
+        setSessionPickerManualSid("");
+        setSessionPickerPreviewRows([]);
+        setSessionPickerPreviewLimit(SESSION_PREVIEW_PAGE);
+        setSessionPickerPreviewTotal(0);
+        setSessionPickerPreviewHasMore(false);
+        setSessionPickerPreviewError("");
+        setSessionPickerPreviewLoading(false);
+      }
+      if (selected && (!keepPickerState || selected !== sessionPickerSelectedSid)) {
+        void loadSessionPreview(paneId, selected, {
+          limit: SESSION_PREVIEW_PAGE
+        });
+      }
+      return;
+    }
+
     setSessionPickerItems([]);
     setSessionPickerTotal(0);
     setSessionPickerHasMore(false);
     setSessionPickerError("");
     setSessionPickerLoading(true);
     setSessionPickerLoadingMore(false);
+    setSessionPickerAutoLoading(false);
     setSessionPickerSelectedSid(preferredSid);
-    setSessionPickerManualSid(preferredSid);
-    setSessionPickerPreviewRows([]);
-    setSessionPickerPreviewLimit(SESSION_PREVIEW_PAGE);
-    setSessionPickerPreviewTotal(0);
-    setSessionPickerPreviewHasMore(false);
-    setSessionPickerPreviewError("");
-    setSessionPickerPreviewLoading(false);
+    if (!keepPickerState) {
+      setSessionPickerCheckedSids([]);
+      setSessionPickerManualSid("");
+      setSessionPickerPreviewRows([]);
+      setSessionPickerPreviewLimit(SESSION_PREVIEW_PAGE);
+      setSessionPickerPreviewTotal(0);
+      setSessionPickerPreviewHasMore(false);
+      setSessionPickerPreviewError("");
+      setSessionPickerPreviewLoading(false);
+    }
 
     const ticket = sessionPickerListTicketRef.current + 1;
     sessionPickerListTicketRef.current = ticket;
@@ -1391,7 +1803,11 @@ function App() {
       const response = await invoke<NativeSessionListResponse>("list_native_session_candidates", {
         paneId,
         offset: 0,
-        limit: SESSION_PICKER_PAGE_SIZE,
+        limit: SESSION_PICKER_INITIAL_PAGE_SIZE,
+        timeFrom: filterQuery.timeFrom,
+        timeTo: filterQuery.timeTo,
+        recordsMin: filterQuery.recordsMin,
+        recordsMax: filterQuery.recordsMax,
         sortBy: sortArgs.sortBy,
         sortOrder: sortArgs.sortOrder
       });
@@ -1401,17 +1817,30 @@ function App() {
       const items = response.items;
       const available = new Set(items.map((item) => item.session_id));
       const selected =
-        preferredSid.length > 0 && available.has(preferredSid)
-          ? preferredSid
-          : items[0]?.session_id ?? preferredSid;
+        preferredSids.find((sid) => available.has(sid)) ?? items[0]?.session_id ?? preferredSid;
       setSessionPickerItems(items);
       setSessionPickerTotal(response.total);
       setSessionPickerHasMore(response.has_more);
       setSessionPickerSelectedSid(selected);
-      setSessionPickerManualSid(selected);
       if (selected) {
         void loadSessionPreview(paneId, selected, {
           limit: SESSION_PREVIEW_PAGE
+        });
+      }
+      if (response.has_more) {
+        void autoLoadRemainingSessionCandidates(
+          paneId,
+          ticket,
+          sortMode,
+          filterQuery,
+          response.items.length,
+          items,
+          cacheKey
+        );
+      } else {
+        sessionPickerListCacheRef.current.set(cacheKey, {
+          loaded_at_ms: Date.now(),
+          items
         });
       }
     } catch (error) {
@@ -1429,10 +1858,23 @@ function App() {
   };
 
   const loadMoreSessionCandidates = async () => {
-    if (!sessionPickerOpen || !sessionPickerPaneId || sessionPickerLoadingMore || !sessionPickerHasMore) {
+    if (
+      !sessionPickerOpen ||
+      !sessionPickerPaneId ||
+      sessionPickerLoadingMore ||
+      sessionPickerAutoLoading ||
+      !sessionPickerHasMore
+    ) {
       return;
     }
     const sortArgs = sessionSortArgs(sessionPickerSortMode);
+    const filterQuery = parseSessionFilterQuery(
+      sessionPickerTimeFrom,
+      sessionPickerTimeTo,
+      sessionPickerRecordsMin,
+      sessionPickerRecordsMax
+    );
+    const cacheKey = sessionPickerCacheKey(sessionPickerPaneId, filterQuery);
     setSessionPickerLoadingMore(true);
     setSessionPickerError("");
 
@@ -1445,19 +1887,31 @@ function App() {
         paneId: sessionPickerPaneId,
         offset,
         limit: SESSION_PICKER_PAGE_SIZE,
+        timeFrom: filterQuery.timeFrom,
+        timeTo: filterQuery.timeTo,
+        recordsMin: filterQuery.recordsMin,
+        recordsMax: filterQuery.recordsMax,
         sortBy: sortArgs.sortBy,
         sortOrder: sortArgs.sortOrder
       });
       if (sessionPickerListTicketRef.current !== ticket) {
         return;
       }
+      let mergedItems: NativeSessionCandidate[] = [];
       setSessionPickerItems((current) => {
         const seen = new Set(current.map((item) => item.session_id));
         const appended = response.items.filter((item) => !seen.has(item.session_id));
-        return [...current, ...appended];
+        mergedItems = [...current, ...appended];
+        return mergedItems;
       });
       setSessionPickerTotal(response.total);
       setSessionPickerHasMore(response.has_more);
+      if (!response.has_more && mergedItems.length > 0) {
+        sessionPickerListCacheRef.current.set(cacheKey, {
+          loaded_at_ms: Date.now(),
+          items: mergedItems
+        });
+      }
     } catch (error) {
       if (sessionPickerListTicketRef.current !== ticket) {
         return;
@@ -1477,11 +1931,34 @@ function App() {
       return;
     }
     setSessionPickerSelectedSid(sessionId);
-    setSessionPickerManualSid(sessionId);
     setSessionPickerPreviewLimit(SESSION_PREVIEW_PAGE);
     void loadSessionPreview(sessionPickerPaneId, sessionId, {
       limit: SESSION_PREVIEW_PAGE
     });
+  };
+
+  const toggleSessionCandidateChecked = (sessionId: string) => {
+    setSessionPickerCheckedSids((current) => {
+      if (current.includes(sessionId)) {
+        return current.filter((sid) => sid !== sessionId);
+      }
+      return [...current, sessionId];
+    });
+  };
+
+  const selectAllVisibleSessionCandidates = () => {
+    setSessionPickerCheckedSids((current) => {
+      const merged = mergeSessionIdLists(
+        current,
+        sessionPickerItems.map((item) => item.session_id)
+      );
+      return merged;
+    });
+  };
+
+  const clearSessionPickerSelections = () => {
+    setSessionPickerCheckedSids([]);
+    setSessionPickerManualSid("");
   };
 
   const loadMoreSessionPreview = () => {
@@ -1505,8 +1982,51 @@ function App() {
     });
   };
 
+  const applySessionPickerFilters = () => {
+    if (!sessionPickerPaneId) {
+      return;
+    }
+    const filterQuery = parseSessionFilterQuery(
+      sessionPickerTimeFrom,
+      sessionPickerTimeTo,
+      sessionPickerRecordsMin,
+      sessionPickerRecordsMax
+    );
+    void openSessionPicker(sessionPickerPaneId, sessionPickerSortMode, filterQuery);
+  };
+
+  const resetSessionPickerFilters = () => {
+    if (!sessionPickerPaneId) {
+      return;
+    }
+    setSessionPickerTimeFrom("");
+    setSessionPickerTimeTo("");
+    setSessionPickerRecordsMin("");
+    setSessionPickerRecordsMax("");
+    void openSessionPicker(sessionPickerPaneId, sessionPickerSortMode, {
+      timeFrom: null,
+      timeTo: null,
+      recordsMin: null,
+      recordsMax: null
+    });
+  };
+
+  const handleSessionPickerFilterEnter = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== "Enter") {
+      return;
+    }
+    event.preventDefault();
+    applySessionPickerFilters();
+  };
+
   const applySessionPickerSid = () => {
-    const sid = sessionPickerManualSid.trim();
+    const mergedSessionIds =
+      sessionPickerMergedSids.length > 0
+        ? sessionPickerMergedSids
+        : sessionPickerSelectedSid.trim()
+          ? [sessionPickerSelectedSid.trim()]
+          : [];
+    const sid = formatSessionIdList(mergedSessionIds);
     if (!sessionPickerPaneId) {
       return;
     }
@@ -1672,9 +2192,11 @@ function App() {
       markPipelineEdge("log_import", "ok", `触发 ${pane.provider} 导入任务`);
 
       try {
+        const requestedSessionIds = parseSessionIdList(pane.native_session_id);
         const summary = await invoke<NativeImportResult>("import_native_history", {
           paneId,
-          sessionId: pane.native_session_id || null
+          sessionId: requestedSessionIds.length === 1 ? requestedSessionIds[0] : null,
+          sessionIds: requestedSessionIds.length ? requestedSessionIds : null
         });
         const [entries, totalRecords] = await Promise.all([
           invoke<EntryRecord[]>("list_entries", {
@@ -1696,6 +2218,20 @@ function App() {
         const parseOnlyError = summary.parse_errors > 0 && summary.imported === 0;
         const importedStatus: PipelineStatus =
           summary.imported > 0 ? "ok" : summary.parse_errors > 0 ? "warn" : "warn";
+        const importedSessionIds =
+          summary.session_ids?.length
+            ? mergeSessionIdLists(summary.session_ids, [])
+            : parseSessionIdList(summary.session_id);
+        for (const key of Array.from(sessionPickerListCacheRef.current.keys())) {
+          if (key.startsWith(`${paneId}::`)) {
+            sessionPickerListCacheRef.current.delete(key);
+          }
+        }
+        const sidSummaryText = importedSessionIds.length
+          ? importedSessionIds.length <= 2
+            ? importedSessionIds.join(", ")
+            : `${importedSessionIds[0]}, ${importedSessionIds[1]} 等 ${importedSessionIds.length} 个`
+          : summary.session_id;
         let nextConsecutive = 0;
         let breakerOpened = false;
 
@@ -1719,9 +2255,11 @@ function App() {
                     Boolean(options?.silent) &&
                     parseOnlyError &&
                     row.consecutive_parse_errors + 1 >= AUTO_IMPORT_BREAKER_THRESHOLD,
-                  native_session_id: summary.session_id,
+                  native_session_id: importedSessionIds.length
+                    ? formatSessionIdList(importedSessionIds)
+                    : summary.session_id,
                   last_import_summary: [
-                    `${summary.provider} sid ${summary.session_id} | +${summary.imported}, skip ${summary.skipped}, parse_err ${summary.parse_errors}`,
+                    `${summary.provider} sid ${sidSummaryText} | +${summary.imported}, skip ${summary.skipped}, parse_err ${summary.parse_errors}`,
                     parseOnlyError
                       ? `连续解析异常 ${row.consecutive_parse_errors + 1}/${AUTO_IMPORT_BREAKER_THRESHOLD}`
                       : "",
@@ -1745,7 +2283,7 @@ function App() {
           breakerOpened ? "warn" : "ok",
           breakerOpened
             ? `${summary.provider} 自动导入已熔断（连续解析异常 ${nextConsecutive} 次）`
-            : `${summary.provider} 导入完成（sid=${summary.session_id}）`
+            : `${summary.provider} 导入完成（sid=${sidSummaryText}）`
         );
         markPipelineEdge(
           "import_store",
@@ -2315,6 +2853,30 @@ function App() {
                 恢复默认
               </button>
             </div>
+            <div className="settings-actions">
+              <label className="compact-field">
+                会话列表缓存(秒)
+                <input
+                  type="number"
+                  min={0}
+                  max={600}
+                  value={sessionListCacheTtlSecs}
+                  onChange={(event) =>
+                    setSessionListCacheTtlSecs(clamp(Number(event.target.value || 0), 0, 600))
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void saveSessionListCacheTtl();
+                    }
+                  }}
+                />
+              </label>
+              <button onClick={() => void saveSessionListCacheTtl()} disabled={savingSessionListCacheTtl}>
+                {savingSessionListCacheTtl ? "保存中..." : "保存缓存设置"}
+              </button>
+              <small>0=关闭缓存；默认 30 秒。仅缓存会话列表，不缓存会话内容预览。</small>
+            </div>
           </section>
 
           <section className="settings-card">
@@ -2728,7 +3290,7 @@ function App() {
             <div className="session-picker-head">
               <div>
                 <strong>{asTitle(sessionPickerProvider)} 会话选择</strong>
-                <small>选择 SID 后点击“使用并关闭”，也可手动输入自定义 SID</small>
+                <small>支持多选 SID；手动输入可用换行/逗号/分号分隔，点击“使用并关闭”后生效</small>
               </div>
               <button onClick={closeSessionPicker}>关闭</button>
             </div>
@@ -2736,36 +3298,18 @@ function App() {
             <div className="session-picker-toolbar">
               <label className="session-picker-custom-field">
                 自定义 SID
-                <input
-                  type="text"
+                <textarea
+                  className="session-picker-custom-textarea"
                   value={sessionPickerManualSid}
-                  placeholder="输入或从列表选择 SID"
+                  placeholder="支持多行：每行一个 SID，或用逗号/分号分隔"
                   onChange={(event) => setSessionPickerManualSid(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter") {
+                    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
                       event.preventDefault();
                       applySessionPickerSid();
                     }
                   }}
                 />
-              </label>
-              <label className="session-picker-sort-field">
-                排序
-                <select
-                  value={sessionPickerSortMode}
-                  onChange={(event) => {
-                    const next = event.target.value as SessionPickerSortMode;
-                    setSessionPickerSortMode(next);
-                    if (sessionPickerPaneId) {
-                      void openSessionPicker(sessionPickerPaneId, next);
-                    }
-                  }}
-                >
-                  <option value="time_desc">时间：新 -&gt; 旧</option>
-                  <option value="time_asc">时间：旧 -&gt; 新</option>
-                  <option value="records_desc">记录数：多 -&gt; 少</option>
-                  <option value="records_asc">记录数：少 -&gt; 多</option>
-                </select>
               </label>
               <button onClick={applySessionPickerSid}>使用并关闭</button>
             </div>
@@ -2774,41 +3318,175 @@ function App() {
               <section className="session-picker-column">
                 <div className="session-picker-column-head">
                   <strong>会话 ID</strong>
-                  <small>共 {sessionPickerTotal} 条</small>
+                  <small>
+                    已加载 {sessionPickerItems.length} / {sessionPickerTotal}
+                    {sessionPickerTotal > 0 ? `（${sessionPickerLoadPercent}%）` : ""}
+                    {sessionPickerFilterActive ? "（已筛选）" : ""}
+                    {" | "}
+                    已选 {sessionPickerMergedSids.length} 个
+                  </small>
                 </div>
                 <div className="session-picker-selected-full">
-                  <span>当前完整 SID</span>
-                  <code>{sessionPickerManualSid.trim() || "(未选择)"}</code>
+                  <span>待导入 SID（{sessionPickerMergedSids.length}）</span>
+                  <code>
+                    {sessionPickerMergedSids.length
+                      ? formatSessionIdList(sessionPickerMergedSids)
+                      : "(未选择)"}
+                  </code>
                 </div>
-                {sessionPickerLoading ? (
-                  <div className="session-picker-empty">正在加载会话列表...</div>
-                ) : sessionPickerError ? (
-                  <div className="session-picker-empty warn-text">{sessionPickerError}</div>
-                ) : sessionPickerItems.length === 0 ? (
-                  <div className="session-picker-empty">暂无可用 SID</div>
-                ) : (
-                  <div className="session-picker-list">
-                    {sessionPickerItems.map((item) => (
+                <div className="session-picker-load-progress" aria-hidden="true">
+                  <span style={{ width: `${sessionPickerLoadPercent}%` }} />
+                </div>
+                <div className="session-picker-list-stack">
+                  <div className="session-picker-filter-panel">
+                    <div className="session-picker-filter-grid">
+                      <label className="session-picker-filter-field">
+                        排序
+                        <select
+                          value={sessionPickerSortMode}
+                          onChange={(event) => {
+                            const next = event.target.value as SessionPickerSortMode;
+                            setSessionPickerSortMode(next);
+                            if (sessionPickerPaneId) {
+                              void openSessionPicker(sessionPickerPaneId, next);
+                            }
+                          }}
+                        >
+                          <option value="time_desc">时间：新 -&gt; 旧</option>
+                          <option value="time_asc">时间：旧 -&gt; 新</option>
+                          <option value="records_desc">记录数：多 -&gt; 少</option>
+                          <option value="records_asc">记录数：少 -&gt; 多</option>
+                        </select>
+                      </label>
+                      <label className="session-picker-filter-field">
+                        时间从
+                        <input
+                          type="datetime-local"
+                          value={sessionPickerTimeFrom}
+                          onChange={(event) => setSessionPickerTimeFrom(event.target.value)}
+                          onKeyDown={handleSessionPickerFilterEnter}
+                        />
+                      </label>
+                      <label className="session-picker-filter-field">
+                        时间到
+                        <input
+                          type="datetime-local"
+                          value={sessionPickerTimeTo}
+                          onChange={(event) => setSessionPickerTimeTo(event.target.value)}
+                          onKeyDown={handleSessionPickerFilterEnter}
+                        />
+                      </label>
+                      <label className="session-picker-filter-field">
+                        记录数最小
+                        <input
+                          type="number"
+                          min={0}
+                          step={1}
+                          inputMode="numeric"
+                          value={sessionPickerRecordsMin}
+                          onChange={(event) => setSessionPickerRecordsMin(event.target.value)}
+                          onKeyDown={handleSessionPickerFilterEnter}
+                        />
+                      </label>
+                      <label className="session-picker-filter-field">
+                        记录数最大
+                        <input
+                          type="number"
+                          min={0}
+                          step={1}
+                          inputMode="numeric"
+                          value={sessionPickerRecordsMax}
+                          onChange={(event) => setSessionPickerRecordsMax(event.target.value)}
+                          onKeyDown={handleSessionPickerFilterEnter}
+                        />
+                      </label>
+                    </div>
+                    <div className="session-picker-filter-actions">
                       <button
-                        key={`${item.provider}-${item.session_id}`}
-                        className={`session-picker-item ${
-                          sessionPickerSelectedSid === item.session_id ? "active" : ""
-                        }`}
-                        onClick={() => selectSessionCandidate(item.session_id)}
+                        onClick={selectAllVisibleSessionCandidates}
+                        disabled={sessionPickerLoading || sessionPickerLoadingMore || !sessionPickerItems.length}
                       >
-                        <span className="session-picker-item-sid">{shortSessionId(item.session_id)}</span>
-                        <small>
-                          创建：{item.started_at > 0 ? formatTs(item.started_at) : "未知"}
-                        </small>
-                        <small>
-                          记录：{item.record_count} | 文件：{item.source_files}
-                        </small>
+                        全选当前页
                       </button>
-                    ))}
+                      <button
+                        onClick={clearSessionPickerSelections}
+                        disabled={sessionPickerLoading || sessionPickerLoadingMore}
+                      >
+                        清空已选
+                      </button>
+                      <button
+                        onClick={applySessionPickerFilters}
+                        disabled={sessionPickerLoading || sessionPickerLoadingMore}
+                      >
+                        应用筛选
+                      </button>
+                      <button
+                        onClick={resetSessionPickerFilters}
+                        disabled={sessionPickerLoading || sessionPickerLoadingMore}
+                      >
+                        重置
+                      </button>
+                    </div>
                   </div>
-                )}
+                  {sessionPickerLoading ? (
+                    <div className="session-picker-empty">正在加载会话列表...</div>
+                  ) : sessionPickerError ? (
+                    <div className="session-picker-empty warn-text">{sessionPickerError}</div>
+                  ) : sessionPickerItems.length === 0 ? (
+                    <div className="session-picker-empty">暂无可用 SID</div>
+                  ) : (
+                    <div className="session-picker-list">
+                      {sessionPickerItems.map((item) => {
+                        const picked = sessionPickerCheckedSids.includes(item.session_id);
+                        return (
+                          <article
+                            key={`${item.provider}-${item.session_id}`}
+                            className={`session-picker-item ${
+                              sessionPickerSelectedSid === item.session_id ? "active" : ""
+                            } ${picked ? "picked" : ""}`}
+                          >
+                            <button
+                              className="session-picker-item-preview-btn"
+                              onClick={() => selectSessionCandidate(item.session_id)}
+                            >
+                              <span className="session-picker-item-sid">{shortSessionId(item.session_id)}</span>
+                              <small>
+                                创建：{item.started_at > 0 ? formatTs(item.started_at) : "未知"}
+                              </small>
+                              <small>
+                                记录：{item.record_count} | 文件：{item.source_files}
+                              </small>
+                            </button>
+                            <div className="session-picker-item-actions">
+                              <small>{picked ? "已选中导入" : "未选中导入"}</small>
+                              <label className="session-picker-item-check">
+                                <input
+                                  type="checkbox"
+                                  checked={picked}
+                                  onChange={() => toggleSessionCandidateChecked(item.session_id)}
+                                />
+                                <span>{picked ? "取消" : "选中"}</span>
+                              </label>
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
                 <div className="session-picker-foot">
-                  {sessionPickerHasMore ? (
+                  {sessionPickerIndexNote ? (
+                    <small
+                      className={`session-picker-index-progress ${
+                        sessionPickerIndexProgress?.running ? "running" : ""
+                      }`}
+                    >
+                      {sessionPickerIndexNote}
+                    </small>
+                  ) : null}
+                  {sessionPickerAutoLoading ? (
+                    <small>后台加载中... 已加载 {sessionPickerItems.length} / {sessionPickerTotal}</small>
+                  ) : sessionPickerHasMore ? (
                     <button onClick={() => void loadMoreSessionCandidates()} disabled={sessionPickerLoadingMore}>
                       {sessionPickerLoadingMore ? "加载中..." : "加载更多 SID"}
                     </button>
