@@ -1,6 +1,6 @@
 [package]
 name = "ai-shell"
-version = "0.1.0"
+version = "0.1.1"
 description = "Terminal-style multi provider workspace for Codex/Claude/Gemini"
 authors = ["EDY"]
 license = ""
@@ -13,11 +13,13 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 portable-pty = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+rhai = { version = "1", features = ["serde"] }
 strip-ansi-escapes = "0.2"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
