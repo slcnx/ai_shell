@@ -1,6 +1,6 @@
 [package]
 name = "ai-shell"
-version = "0.1.2"
+version = "0.1.3"
 description = "Terminal-style multi provider workspace for Codex/Claude/Gemini"
 authors = ["EDY"]
 license = ""
