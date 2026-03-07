@@ -31,6 +31,7 @@ struct AppState {
     panes: Mutex<HashMap<String, PaneRuntime>>,
     pane_runtime_starts: Mutex<HashMap<String, i64>>,
     native_session_candidates_cache: Mutex<HashMap<String, NativeSessionCandidatesCache>>,
+    native_session_preview_cache: Mutex<HashMap<String, NativeSessionPreviewCache>>,
     native_session_record_count_cache: Mutex<HashMap<String, NativeSessionRecordCountCache>>,
     native_session_first_input_cache: Mutex<HashMap<String, NativeSessionFirstInputCache>>,
     native_session_index_progress: Mutex<HashMap<String, NativeSessionIndexProgress>>,
@@ -48,6 +49,12 @@ struct AppState {
 struct NativeSessionCandidatesCache {
     updated_at: i64,
     batch: NativeSessionCandidatesBatch,
+}
+
+#[derive(Debug, Clone)]
+struct NativeSessionPreviewCache {
+    updated_at: i64,
+    rows: Vec<NativeSessionPreviewRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -2444,6 +2451,14 @@ fn build_native_scan_cache_key(provider: &str, matcher: Option<&SessionFileMatch
         return format!("{}::{}", provider, filter.cache_key_suffix());
     }
     provider.to_string()
+}
+
+fn build_native_preview_cache_key(
+    provider: &str,
+    matcher: Option<&SessionFileMatcher>,
+    session_id: &str,
+) -> String {
+    format!("{}::preview::{}", build_native_scan_cache_key(provider, matcher), session_id.trim())
 }
 
 #[derive(Debug, Clone)]
@@ -4982,12 +4997,27 @@ fn build_native_session_candidates_batch_from_index_rows(
 
 fn clear_native_session_caches_for_provider(state: &AppState, provider: &str) {
     invalidate_native_session_candidates_cache(state, provider);
+    invalidate_native_session_preview_cache(state, provider);
     invalidate_native_session_record_count_cache_by_provider(state, provider);
     invalidate_native_session_first_input_cache_by_provider(state, provider);
 }
 
 fn invalidate_native_session_candidates_cache(state: &AppState, provider: &str) {
     if let Ok(mut cache) = state.native_session_candidates_cache.lock() {
+        let prefix = format!("{}::", provider);
+        let keys = cache
+            .keys()
+            .filter(|key| key.as_str() == provider || key.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            cache.remove(&key);
+        }
+    }
+}
+
+fn invalidate_native_session_preview_cache(state: &AppState, provider: &str) {
+    if let Ok(mut cache) = state.native_session_preview_cache.lock() {
         let prefix = format!("{}::", provider);
         let keys = cache
             .keys()
@@ -6905,6 +6935,7 @@ fn preview_native_session_messages(
     pane_id: String,
     session_id: String,
     limit: Option<i64>,
+    offset: Option<i64>,
     load_all: Option<bool>,
     from_end: Option<bool>,
 ) -> Result<NativeSessionPreviewResponse, String> {
@@ -6917,52 +6948,79 @@ fn preview_native_session_messages(
         return Err("session_id is empty".to_string());
     }
     let message_limit = limit.unwrap_or(200).clamp(1, 5000) as usize;
+    let message_offset = offset.unwrap_or(0).max(0) as usize;
     let load_all_flag = load_all.unwrap_or(false);
     let from_end_flag = from_end.unwrap_or(false);
-    let (rows, total_rows, has_more) = if load_all_flag {
-        let all_rows = collect_native_session_preview_rows_for_provider(
+    let cache_ttl_secs = session_cache_ttl_secs(&state);
+    let cache_key = build_native_preview_cache_key(&native_provider, matcher.as_ref(), &normalized);
+    let now = now_epoch();
+
+    let all_rows = if load_all_flag {
+        collect_native_session_preview_rows_for_provider(
             &state,
             &native_provider,
             &normalized,
             matcher.as_ref(),
         )
-        .map_err(|error| error.to_string())?;
-        let total_rows = all_rows.len() as i64;
-        (all_rows, total_rows, false)
-    } else if from_end_flag {
-        let all_rows = collect_native_session_preview_rows_for_provider(
-            &state,
-            &native_provider,
-            &normalized,
-            matcher.as_ref(),
-        )
-        .map_err(|error| error.to_string())?;
-        let total_rows = all_rows.len() as i64;
-        let start = all_rows.len().saturating_sub(message_limit);
-        let has_more = start > 0;
-        (all_rows.into_iter().skip(start).collect::<Vec<_>>(), total_rows, has_more)
-    } else {
-        let collected = collect_native_session_preview_rows_for_provider_limited(
-            &state,
-            &native_provider,
-            &normalized,
-            matcher.as_ref(),
-            Some(message_limit),
-        )
-        .map_err(|error| error.to_string())?;
-        let loaded = collected.rows.len() as i64;
-        let estimated_total = if collected.has_more {
-            count_native_session_records_for_provider(
+        .map_err(|error| error.to_string())?
+    } else if let Ok(cache) = state.native_session_preview_cache.lock() {
+        if let Some(hit) = cache.get(&cache_key) {
+            if cache_ttl_secs > 0 && now.saturating_sub(hit.updated_at) <= cache_ttl_secs {
+                hit.rows.clone()
+            } else {
+                collect_native_session_preview_rows_for_provider(
+                    &state,
+                    &native_provider,
+                    &normalized,
+                    matcher.as_ref(),
+                )
+                .map_err(|error| error.to_string())?
+            }
+        } else {
+            collect_native_session_preview_rows_for_provider(
                 &state,
                 &native_provider,
                 &normalized,
                 matcher.as_ref(),
             )
-            .max(loaded.saturating_add(1))
-        } else {
-            loaded
-        };
-        (collected.rows, estimated_total, collected.has_more)
+            .map_err(|error| error.to_string())?
+        }
+    } else {
+        collect_native_session_preview_rows_for_provider(
+            &state,
+            &native_provider,
+            &normalized,
+            matcher.as_ref(),
+        )
+        .map_err(|error| error.to_string())?
+    };
+
+    if !load_all_flag {
+        if let Ok(mut cache) = state.native_session_preview_cache.lock() {
+            cache.insert(
+                cache_key,
+                NativeSessionPreviewCache {
+                    updated_at: now,
+                    rows: all_rows.clone(),
+                },
+            );
+        }
+    }
+
+    let total_rows = all_rows.len() as i64;
+    let (rows, has_more) = if load_all_flag {
+        (all_rows, false)
+    } else if from_end_flag {
+        let total = all_rows.len();
+        let end = total.saturating_sub(message_offset);
+        let start = end.saturating_sub(message_limit);
+        let has_more = start > 0;
+        (all_rows.into_iter().skip(start).take(end.saturating_sub(start)).collect::<Vec<_>>(), has_more)
+    } else {
+        let start = message_offset.min(all_rows.len());
+        let end = (start + message_limit).min(all_rows.len());
+        let has_more = end < all_rows.len();
+        (all_rows.into_iter().skip(start).take(end.saturating_sub(start)).collect::<Vec<_>>(), has_more)
     };
     let loaded_rows = rows.len();
     Ok(NativeSessionPreviewResponse {
@@ -8052,6 +8110,7 @@ fn main() {
                 panes: Mutex::new(HashMap::new()),
                 pane_runtime_starts: Mutex::new(HashMap::new()),
                 native_session_candidates_cache: Mutex::new(HashMap::new()),
+                native_session_preview_cache: Mutex::new(HashMap::new()),
                 native_session_record_count_cache: Mutex::new(HashMap::new()),
                 native_session_first_input_cache: Mutex::new(HashMap::new()),
                 native_session_index_progress: Mutex::new(HashMap::new()),

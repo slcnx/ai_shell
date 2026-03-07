@@ -4047,7 +4047,14 @@ function App() {
   );
 
   const loadSyncDialogPreviewSession = useCallback(
-    async (paneId: string, sessionId: string, requestedLimit = 10, fromEnd = false) => {
+    async (
+      paneId: string,
+      sessionId: string,
+      requestedLimit = 10,
+      fromEnd = false,
+      offset = 0,
+      mergeMode: "replace" | "prepend" | "append" = "replace"
+    ) => {
       const sid = sessionId.trim();
       if (!paneId || !sid) {
         setSyncDialogPreview(createSyncDialogPreviewState());
@@ -4067,6 +4074,7 @@ function App() {
           paneId,
           sessionId: sid,
           limit: requestedLimit,
+          offset,
           loadAll: false,
           fromEnd
         });
@@ -4080,14 +4088,23 @@ function App() {
         if (syncDialogPreviewTicketRef.current !== ticket) {
           return;
         }
-        setSyncDialogPreview({
-          preview_session_id: sid,
-          preview_loading: false,
-          preview_rows: response.rows || [],
-          preview_total_rows: Number(response.total_rows || 0),
-          preview_loaded_rows: Number(response.loaded_rows || 0),
-          preview_has_more: Boolean(response.has_more),
-          preview_from_end: fromEnd
+        setSyncDialogPreview((current) => {
+          const incomingRows = response.rows || [];
+          const nextRows =
+            mergeMode === "prepend" && current.preview_session_id === sid
+              ? [...incomingRows, ...current.preview_rows]
+              : mergeMode === "append" && current.preview_session_id === sid
+                ? [...current.preview_rows, ...incomingRows]
+                : incomingRows;
+          return {
+            preview_session_id: sid,
+            preview_loading: false,
+            preview_rows: nextRows,
+            preview_total_rows: Number(response.total_rows || 0),
+            preview_loaded_rows: nextRows.length,
+            preview_has_more: Boolean(response.has_more),
+            preview_from_end: fromEnd
+          };
         });
       } catch (error) {
         if (syncDialogPreviewTicketRef.current !== ticket) {
@@ -4110,8 +4127,10 @@ function App() {
     await loadSyncDialogPreviewSession(
       paneId,
       sessionId,
-      Math.max(10, syncDialogPreview.preview_loaded_rows + 10),
-      syncDialogPreview.preview_from_end
+      10,
+      syncDialogPreview.preview_from_end,
+      syncDialogPreview.preview_loaded_rows,
+      syncDialogPreview.preview_from_end ? "prepend" : "append"
     );
   }, [
     loadSyncDialogPreviewSession,
@@ -4126,7 +4145,7 @@ function App() {
     const paneId = syncDialog.pane_id;
     const sid = syncDialogPreview.preview_session_id.trim();
     if (paneId && sid) {
-      await loadSyncDialogPreviewSession(paneId, sid, 10, false);
+      await loadSyncDialogPreviewSession(paneId, sid, 10, false, 0, "replace");
       return;
     }
     setSyncDialogPreviewScrollCommand((current) => ({
@@ -4188,7 +4207,7 @@ function App() {
       }
       setSyncDialog((current) => ({ ...current, loading: true }));
       try {
-        await loadSyncDialogPreviewSession(paneId, sid, 10, true);
+        await loadSyncDialogPreviewSession(paneId, sid, 10, true, 0, "replace");
         setSyncDialog((current) => ({
           ...current,
           loading: false,
