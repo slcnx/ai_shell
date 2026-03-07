@@ -10,6 +10,7 @@ import {
   Button,
   Card,
   ColorPicker,
+  Collapse,
   ConfigProvider,
   Drawer,
   Form,
@@ -130,6 +131,7 @@ type SessionParserSamplePreviewResponse = {
   file_path: string;
   file_format: string;
   sample_value: unknown;
+  message_sample_value?: unknown | null;
 };
 
 type CreatePanePathTarget =
@@ -142,6 +144,8 @@ type CreatePanePathTarget =
   | "rule_content_item_path"
   | "rule_content_item_filter_path";
 
+type CreatePaneSampleViewMode = "root" | "message";
+
 type CreatePaneSamplePreviewState = {
   loading: boolean;
   error: string;
@@ -149,6 +153,7 @@ type CreatePaneSamplePreviewState = {
   file_path: string;
   file_format: string;
   sample_value: unknown | null;
+  message_sample_value: unknown | null;
 };
 
 type AppConfigResponse = {
@@ -298,6 +303,16 @@ type SyncSessionListState = {
   records_max: number | null;
 };
 
+type SyncDialogPreviewState = {
+  preview_session_id: string;
+  preview_loading: boolean;
+  preview_rows: NativeSessionPreviewRow[];
+  preview_total_rows: number;
+  preview_loaded_rows: number;
+  preview_has_more: boolean;
+  preview_from_end: boolean;
+};
+
 type EntryRecord = {
   id: string;
   pane_id: string;
@@ -391,6 +406,7 @@ type SyncDialogState = {
   preview_session_id: string;
   strategy: SyncStrategy;
   selected_session_ids: string[];
+  included_entry_ids: string[];
   excluded_entry_ids: string[];
   preview_query: string;
   preview_kind: SyncPreviewKind;
@@ -623,6 +639,15 @@ function createPanePathTargetLabel(target: CreatePanePathTarget): string {
     return "消息项路径";
   }
   return "消息项过滤路径";
+}
+
+function isCreatePanePathTargetMulti(target: CreatePanePathTarget): boolean {
+  return (
+    target === "session_id_paths" ||
+    target === "started_at_paths" ||
+    target === "rule_content_text_paths" ||
+    target === "rule_timestamp_paths"
+  );
 }
 
 function jsonPathTokensToParserPath(pathTokens: JsonPathToken[]): string {
@@ -1259,6 +1284,23 @@ function pickEntriesBySyncStrategyPerSession(
   return merged;
 }
 
+function collectSyncSelectableSessionEntries(
+  entries: EntryRecord[],
+  sessionId: string,
+  activeSessionId: string,
+  strategy: SyncStrategy,
+  previewKind: SyncPreviewKind,
+  keyword: string
+): EntryRecord[] {
+  const sid = sessionId.trim();
+  if (!sid) {
+    return [];
+  }
+  const sessionEntries = entries.filter((entry) => resolveEntrySessionId(entry, activeSessionId) === sid);
+  const scoped = pickEntriesBySyncStrategyPerSession(sessionEntries, strategy, activeSessionId);
+  return scoped.filter((entry) => matchesSyncPreviewFilter(entry, previewKind, keyword));
+}
+
 function syncStrategyLabel(strategy: SyncStrategy): string {
   if (strategy === "turn_1") {
     return "最近 1 轮";
@@ -1362,6 +1404,34 @@ async function copyTextToClipboard(text: string): Promise<void> {
   if (!copied) {
     throw new Error("clipboard copy failed");
   }
+}
+
+function sanitizeSyncPlainTextContent(value: string): string {
+  return value
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/^\s*>+\s?/, "").trimEnd())
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return false;
+      }
+      if (trimmed === "```" || trimmed === "..." || trimmed === "{" || trimmed === "}") {
+        return false;
+      }
+      if (/^https?:\/\/ipc\.localhost\//i.test(trimmed)) {
+        return false;
+      }
+      if (/^[{}\[\],]+$/.test(trimmed)) {
+        return false;
+      }
+      if (/^"[A-Za-z0-9_\-]+"\s*:\s*.+,?$/.test(trimmed)) {
+        return false;
+      }
+      return true;
+    })
+    .join("\n")
+    .trim();
 }
 
 function isDirectAvatarSrc(path: string, fallbackToken: string): boolean {
@@ -1544,6 +1614,18 @@ function createSyncSessionListState(paneId = ""): SyncSessionListState {
   };
 }
 
+function createSyncDialogPreviewState(): SyncDialogPreviewState {
+  return {
+    preview_session_id: "",
+    preview_loading: false,
+    preview_rows: [],
+    preview_total_rows: 0,
+    preview_loaded_rows: 0,
+    preview_has_more: false,
+    preview_from_end: false
+  };
+}
+
 function createSyncDialogState(): SyncDialogState {
   return {
     open: false,
@@ -1555,6 +1637,7 @@ function createSyncDialogState(): SyncDialogState {
     preview_session_id: "",
     strategy: "turn_3",
     selected_session_ids: [],
+    included_entry_ids: [],
     excluded_entry_ids: [],
     preview_query: "",
     preview_kind: "all",
@@ -1653,8 +1736,10 @@ function App() {
     parser_profile: "",
     file_path: "",
     file_format: "",
-    sample_value: null
+    sample_value: null,
+    message_sample_value: null
   });
+  const [createPaneSampleViewMode, setCreatePaneSampleViewMode] = useState<CreatePaneSampleViewMode>("root");
   const [sendDialog, setSendDialog] = useState<SendDialogState>(() => createSendDialogState());
   const [unrecognizedFilePreviewDialog, setUnrecognizedFilePreviewDialog] =
     useState<UnrecognizedFilePreviewDialogState>(() => createUnrecognizedFilePreviewDialogState());
@@ -1674,8 +1759,15 @@ function App() {
   const [syncSessionListState, setSyncSessionListState] = useState<SyncSessionListState>(() =>
     createSyncSessionListState()
   );
+  const [syncDialogPreview, setSyncDialogPreview] = useState<SyncDialogPreviewState>(() =>
+    createSyncDialogPreviewState()
+  );
+  const [syncDialogPreviewScrollCommand, setSyncDialogPreviewScrollCommand] = useState<
+    { target: "top" | "bottom"; nonce: number } | null
+  >(null);
   const [syncShowSelectedOnly, setSyncShowSelectedOnly] = useState(false);
   const sessionManagePreviewTicketRef = useRef(0);
+  const syncDialogPreviewTicketRef = useRef(0);
   const syncDialogEntryCacheRef = useRef<Map<string, EntryRecord[]>>(new Map());
   const [sessionListPanels, setSessionListPanels] = useState<Record<string, SessionListDialogState>>({});
   const sessionListPanelsRef = useRef<Record<string, SessionListDialogState>>({});
@@ -1754,6 +1846,25 @@ function App() {
     createPaneDialog.session_scan_glob,
     createPaneParserConfigPreview.file_format
   ]);
+  const createPaneDisplayedSampleValue =
+    createPaneSampleViewMode === "message" && createPaneSamplePreview.message_sample_value
+      ? createPaneSamplePreview.message_sample_value
+      : createPaneSamplePreview.sample_value;
+  const renderCreatePanePathFieldTitle = useCallback(
+    (label: string, target: CreatePanePathTarget) => (
+      <Space size={8} wrap>
+        <Typography.Text strong>{label}</Typography.Text>
+        <Button
+          size="small"
+          type={createPanePathTarget === target ? "primary" : "default"}
+          onClick={() => setCreatePanePathTarget(target)}
+        >
+          {isCreatePanePathTargetMulti(target) ? "追加路径" : "选择路径"}
+        </Button>
+      </Space>
+    ),
+    [createPanePathTarget]
+  );
   const createPaneParserJsonPreview = useMemo(
     () => JSON.stringify(createPaneParserConfigPreview, null, 2),
     [createPaneParserConfigPreview]
@@ -1864,7 +1975,8 @@ function App() {
         parser_profile: "",
         file_path: "",
         file_format: "",
-        sample_value: null
+        sample_value: null,
+        message_sample_value: null
       }));
       return;
     }
@@ -1890,8 +2002,10 @@ function App() {
         parser_profile: response.parser_profile || createPaneParserId,
         file_path: response.file_path || "",
         file_format: response.file_format || "",
-        sample_value: response.sample_value ?? null
+        sample_value: response.sample_value ?? null,
+        message_sample_value: response.message_sample_value ?? null
       });
+      setCreatePaneSampleViewMode(response.message_sample_value ? "message" : "root");
     } catch (error) {
       if (createPaneSampleTicketRef.current !== ticket) {
         return;
@@ -2032,9 +2146,43 @@ function App() {
     () => new Set(syncDialog.excluded_entry_ids),
     [syncDialog.excluded_entry_ids]
   );
+  const syncDialogIncludedSet = useMemo(
+    () => new Set(syncDialog.included_entry_ids),
+    [syncDialog.included_entry_ids]
+  );
+  const syncDialogManualSelectedSessionSet = useMemo(() => {
+    const sessions = new Set<string>();
+    for (const entry of syncDialog.entries) {
+      if (!syncDialogIncludedSet.has(entry.id)) {
+        continue;
+      }
+      const sid = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+      if (sid) {
+        sessions.add(sid);
+      }
+    }
+    return sessions;
+  }, [syncDialog.entries, syncDialogCurrentSessionId, syncDialogIncludedSet]);
+  const syncDialogVisualSelectedSessionSet = useMemo(() => {
+    const sessions = new Set(syncDialog.selected_session_ids);
+    for (const sid of syncDialogManualSelectedSessionSet) {
+      sessions.add(sid);
+    }
+    return sessions;
+  }, [syncDialog.selected_session_ids, syncDialogManualSelectedSessionSet]);
   const syncDialogPreviewEntries = useMemo(
     () => syncDialogFilteredEntries.filter((entry) => !syncDialogExcludedSet.has(entry.id)),
     [syncDialogFilteredEntries, syncDialogExcludedSet]
+  );
+  const isSyncDialogEntryIncluded = useCallback(
+    (entry: EntryRecord) => {
+      const sessionId = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+      if (sessionId && syncDialogSelectedSessionSet.has(sessionId)) {
+        return !syncDialogExcludedSet.has(entry.id);
+      }
+      return syncDialogIncludedSet.has(entry.id);
+    },
+    [syncDialogCurrentSessionId, syncDialogExcludedSet, syncDialogIncludedSet, syncDialogSelectedSessionSet]
   );
   const syncDialogFilteredExcludedCount = useMemo(
     () => Math.max(0, syncDialogFilteredEntries.length - syncDialogPreviewEntries.length),
@@ -2069,7 +2217,7 @@ function App() {
         total_count: 0,
         excluded_count: 0,
         pending_count: 0,
-        selected: sessionId !== SYNC_UNKNOWN_SESSION_ID && syncDialogSelectedSessionSet.has(sessionId),
+        selected: sessionId !== SYNC_UNKNOWN_SESSION_ID && syncDialogVisualSelectedSessionSet.has(sessionId),
         is_current: Boolean(syncDialogCurrentSessionId) && sessionId === syncDialogCurrentSessionId,
         first_at: 0,
         last_at: 0
@@ -2149,18 +2297,147 @@ function App() {
     syncDialogExcludedSet,
     syncDialogFilteredEntriesAllSessions,
     syncDialogScopedEntriesAllSessions,
-    syncDialogSelectedSessionSet
+    syncDialogVisualSelectedSessionSet
   ]);
   const syncDialogSelectedSessionCount = useMemo(
-    () => syncDialogSessionGroups.filter((group) => group.selected).length,
-    [syncDialogSessionGroups]
+    () => syncDialogVisualSelectedSessionSet.size,
+    [syncDialogVisualSelectedSessionSet]
+  );
+  const syncDialogSessionItemMap = useMemo(
+    () => new Map(syncDialogSessionListState.items.map((item) => [item.session_id, item])),
+    [syncDialogSessionListState.items]
+  );
+  const syncDialogSelectedRecordCount = useMemo(
+    () =>
+      syncDialog.selected_session_ids.reduce(
+        (sum, sessionId) => sum + Math.max(0, Number(syncDialogSessionItemMap.get(sessionId)?.record_count || 0)),
+        0
+      ),
+    [syncDialog.selected_session_ids, syncDialogSessionItemMap]
+  );
+  const syncDialogExcludedSelectedCount = useMemo(
+    () =>
+      syncDialog.entries.reduce((sum, entry) => {
+        const sessionId = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+        if (!sessionId || !syncDialogSelectedSessionSet.has(sessionId) || !syncDialogExcludedSet.has(entry.id)) {
+          return sum;
+        }
+        return sum + 1;
+      }, 0),
+    [syncDialog.entries, syncDialogCurrentSessionId, syncDialogExcludedSet, syncDialogSelectedSessionSet]
+  );
+  const syncDialogManualIncludedCount = useMemo(
+    () => syncDialog.included_entry_ids.length,
+    [syncDialog.included_entry_ids.length]
+  );
+  const syncDialogPendingEntryCount = useMemo(
+    () =>
+      Math.max(0, syncDialogSelectedRecordCount - syncDialogExcludedSelectedCount) +
+      syncDialogManualIncludedCount,
+    [syncDialogExcludedSelectedCount, syncDialogManualIncludedCount, syncDialogSelectedRecordCount]
   );
   const syncDialogIdleText = useMemo(() => {
     if (!syncDialogSelectedSessionCount) {
       return "等待操作：请先勾选会话";
     }
-    return `等待操作：已选会话 ${syncDialogSelectedSessionCount} 个，待同步 ${syncDialogPreviewEntries.length} 条`;
-  }, [syncDialogPreviewEntries.length, syncDialogSelectedSessionCount]);
+    return `等待操作：已选会话 ${syncDialogSelectedSessionCount} 个，待同步 ${syncDialogPendingEntryCount} 条`;
+  }, [syncDialogPendingEntryCount, syncDialogSelectedSessionCount]);
+  const syncDialogPreviewSelectionText = useMemo(() => {
+    const previewSessionId = syncDialog.preview_session_id.trim();
+    if (!previewSessionId) {
+      return `已选会话汇总 · ${syncDialogSelectedSessionCount} 个会话 / ${syncDialogPendingEntryCount} 条消息`;
+    }
+
+    const total = Math.max(0, Number(syncDialogSessionItemMap.get(previewSessionId)?.record_count || 0));
+    if (syncDialogVisualSelectedSessionSet.has(previewSessionId)) {
+      const excludedCount = syncDialog.entries.reduce((sum, entry) => {
+        if (
+          resolveEntrySessionId(entry, syncDialogCurrentSessionId) !== previewSessionId ||
+          !syncDialogExcludedSet.has(entry.id)
+        ) {
+          return sum;
+        }
+        return sum + 1;
+      }, 0);
+      const selectedCount = Math.max(0, total - excludedCount);
+      if (selectedCount <= 0) {
+        return "当前会话：已排空";
+      }
+      if (excludedCount <= 0) {
+        return `当前会话：已全选 (${total})`;
+      }
+      return `当前会话：已选 ${selectedCount}/${total}`;
+    }
+
+    const manualIncludedCount = syncDialog.entries.reduce((sum, entry) => {
+      if (
+        resolveEntrySessionId(entry, syncDialogCurrentSessionId) !== previewSessionId ||
+        !syncDialogIncludedSet.has(entry.id)
+      ) {
+        return sum;
+      }
+      return sum + 1;
+    }, 0);
+    if (manualIncludedCount > 0) {
+      return `当前会话：仅选 ${manualIncludedCount} 条`;
+    }
+    return "当前会话：未选";
+  }, [
+    syncDialog.preview_session_id,
+    syncDialog.entries,
+    syncDialogCurrentSessionId,
+    syncDialogExcludedSet,
+    syncDialogIncludedSet,
+    syncDialogPendingEntryCount,
+    syncDialogSelectedSessionCount,
+    syncDialogVisualSelectedSessionSet,
+    syncDialogSessionItemMap
+  ]);
+  const getSyncDialogSessionSelectionBadge = useCallback(
+    (sessionId: string): { text: string; color: string } | null => {
+      const sid = sessionId.trim();
+      if (!sid) {
+        return null;
+      }
+
+      const total = Math.max(0, Number(syncDialogSessionItemMap.get(sid)?.record_count || 0));
+      if (syncDialogVisualSelectedSessionSet.has(sid)) {
+        const excludedCount = syncDialog.entries.reduce((sum, entry) => {
+          if (resolveEntrySessionId(entry, syncDialogCurrentSessionId) !== sid || !syncDialogExcludedSet.has(entry.id)) {
+            return sum;
+          }
+          return sum + 1;
+        }, 0);
+        const selectedCount = Math.max(0, total - excludedCount);
+        if (selectedCount <= 0) {
+          return { text: "已排空", color: "warning" };
+        }
+        if (excludedCount <= 0) {
+          return { text: `已全选 ${total}`, color: "success" };
+        }
+        return { text: `已选 ${selectedCount}/${total}`, color: "processing" };
+      }
+
+      const manualIncludedCount = syncDialog.entries.reduce((sum, entry) => {
+        if (resolveEntrySessionId(entry, syncDialogCurrentSessionId) !== sid || !syncDialogIncludedSet.has(entry.id)) {
+          return sum;
+        }
+        return sum + 1;
+      }, 0);
+      if (manualIncludedCount > 0) {
+        return { text: `仅选 ${manualIncludedCount}`, color: "gold" };
+      }
+      return null;
+    },
+    [
+      syncDialog.entries,
+      syncDialogCurrentSessionId,
+      syncDialogExcludedSet,
+      syncDialogIncludedSet,
+      syncDialogVisualSelectedSessionSet,
+      syncDialogSessionItemMap
+    ]
+  );
   const syncDialogProgressDisplayText =
     syncDialog.progress_stage === "idle" ? syncDialogIdleText : syncDialog.progress_text;
   const syncDialogTargetOptions = useMemo(
@@ -2206,14 +2483,14 @@ function App() {
       groupSessionCandidates(
         (syncShowSelectedOnly
           ? syncDialogSessionListState.items.filter((item) =>
-              syncDialogSelectedSessionSet.has(item.session_id)
+              syncDialogVisualSelectedSessionSet.has(item.session_id)
             )
           : syncDialogSessionListState.items),
         syncDialogPane?.active_session_id ?? "",
         syncDialogPane?.linked_session_ids ?? []
       ),
     [
-      syncDialogSelectedSessionSet,
+      syncDialogVisualSelectedSessionSet,
       syncShowSelectedOnly,
       syncDialogPane?.active_session_id,
       syncDialogPane?.linked_session_ids,
@@ -2626,6 +2903,82 @@ function App() {
     [refreshScanProgress]
   );
 
+  const shouldWarmupNativeSessionCache = useCallback(
+    async (paneId: string) => {
+      const normalizedPaneId = paneId.trim();
+      if (!normalizedPaneId) {
+        return false;
+      }
+
+      try {
+        const [progress, batch] = await Promise.all([
+          invoke<NativeSessionIndexProgress>("get_native_session_index_progress", { paneId: normalizedPaneId }),
+          loadSessionCandidates(normalizedPaneId, {
+            sortMode: "updated_desc",
+            offset: 0,
+            limit: 1,
+            sidKeyword: "",
+            timeFrom: null,
+            timeTo: null,
+            recordsMin: null,
+            recordsMax: null
+          })
+        ]);
+
+        if (progress.running) {
+          return false;
+        }
+        if (Number(progress.total_files || 0) > 0 || Number(progress.processed_files || 0) > 0) {
+          return false;
+        }
+
+        const totalCandidates = Number(batch.total || 0);
+        const totalUnrecognized = Array.isArray(batch.unrecognized_files)
+          ? batch.unrecognized_files.length
+          : 0;
+        return totalCandidates <= 0 && totalUnrecognized <= 0;
+      } catch (error) {
+        console.error(error);
+        return true;
+      }
+    },
+    []
+  );
+
+  const warmupNativeSessionCache = useCallback(
+    async (paneId: string, silent = true) => {
+      const normalizedPaneId = paneId.trim();
+      if (!normalizedPaneId) {
+        return;
+      }
+
+      updatePane(normalizedPaneId, (pane) => ({
+        ...pane,
+        scan_running: true,
+        scan_processed_files: Math.max(0, pane.scan_processed_files),
+        scan_changed_files: Math.max(0, pane.scan_changed_files)
+      }));
+
+      void refreshScanProgress(normalizedPaneId);
+      const timer = window.setInterval(() => {
+        void refreshScanProgress(normalizedPaneId);
+      }, 500);
+
+      try {
+        await refreshNativeSessionCache(normalizedPaneId);
+        await refreshScanProgress(normalizedPaneId);
+      } catch (error) {
+        console.error(error);
+        if (!silent) {
+          messageApi.error("后台缓存构建失败");
+        }
+      } finally {
+        window.clearInterval(timer);
+      }
+    },
+    [messageApi, refreshNativeSessionCache, refreshScanProgress, updatePane]
+  );
+
   const setPaneSessionState = useCallback(
     async (paneId: string, activeSessionId: string, linkedSessionIds: string[]) => {
       const linked = parseSessionIds(linkedSessionIds);
@@ -3015,13 +3368,15 @@ function App() {
       open: true
     };
     setCreatePanePathTarget("rule_content_text_paths");
+    setCreatePaneSampleViewMode("root");
     setCreatePaneSamplePreview({
       loading: false,
       error: "",
       parser_profile: "",
       file_path: "",
       file_format: "",
-      sample_value: null
+      sample_value: null,
+      message_sample_value: null
     });
     setCreatePaneDialog(nextState);
     if (nextState.provider_mode === "preset") {
@@ -3063,21 +3418,41 @@ function App() {
         sessionScanGlob: sessionScanGlob || null,
         sessionParseJson: sessionParseJson || null
       });
-      const nextPane = createPaneView(summary);
-      setPanes((current) => [...current, nextPane]);
+      setPanes((current) => {
+        const sharedProgressPane = current.find(
+          (pane) =>
+            pane.provider === summary.provider &&
+            (pane.scan_running || pane.scan_total_files > 0 || pane.scan_processed_files > 0)
+        );
+        const nextPane = {
+          ...createPaneView(summary),
+          scan_running: sharedProgressPane?.scan_running ?? false,
+          scan_total_files: sharedProgressPane?.scan_total_files ?? 0,
+          scan_processed_files: sharedProgressPane?.scan_processed_files ?? 0,
+          scan_changed_files: sharedProgressPane?.scan_changed_files ?? 0
+        };
+        return [...current, nextPane];
+      });
       setActivePaneId(summary.id);
       await invoke<boolean>("ensure_pane_runtime", { paneId: summary.id });
       void hydratePaneSessionState(summary.id);
       void refreshScanProgress(summary.id);
+      void shouldWarmupNativeSessionCache(summary.id).then((shouldWarmup) => {
+        if (shouldWarmup) {
+          void warmupNativeSessionCache(summary.id, true);
+        }
+      });
       setCreatePaneDialog(createCreatePaneDialogState(provider, sessionParserProfiles));
       setCreatePanePathTarget("rule_content_text_paths");
+      setCreatePaneSampleViewMode("root");
       setCreatePaneSamplePreview({
         loading: false,
         error: "",
         parser_profile: "",
         file_path: "",
         file_format: "",
-        sample_value: null
+        sample_value: null,
+        message_sample_value: null
       });
       messageApi.success(`已创建 ${asTitle(provider)} 终端`);
     } catch (error) {
@@ -3092,7 +3467,9 @@ function App() {
     messageApi,
     panes,
     refreshScanProgress,
-    sessionParserProfiles
+    sessionParserProfiles,
+    shouldWarmupNativeSessionCache,
+    warmupNativeSessionCache
   ]);
 
   const closePane = useCallback(
@@ -3156,18 +3533,22 @@ function App() {
       if (!pane) {
         return;
       }
+      const cachedPanel = getSessionListPanelState(paneId);
       const fallbackTargetPaneId = panes.find((item) => item.id !== paneId)?.id ?? "";
-      const allSessionIds = parseSessionIds([pane.active_session_id, ...pane.linked_session_ids]);
-      const defaultSelectedSessionIds = pane.active_session_id.trim()
-        ? [pane.active_session_id.trim()]
-        : allSessionIds.slice(0, 1);
+      const cachedItems =
+        cachedPanel.all_items.length > 0 ? cachedPanel.all_items : cachedPanel.items;
+      const initialSessionItems = sortSessionCandidatesByMode(cachedItems, "updated_desc");
+      const defaultSelectedSessionIds: string[] = [];
       const defaultPreviewSessionId = "";
       setSyncDialogGroupTab("current");
       setSyncShowSelectedOnly(false);
       syncDialogEntryCacheRef.current.clear();
       setSyncSessionListState({
         ...createSyncSessionListState(paneId),
-        loading: true
+        loading: initialSessionItems.length === 0,
+        all_items: initialSessionItems,
+        items: initialSessionItems,
+        total: cachedPanel.total > 0 ? cachedPanel.total : initialSessionItems.length
       });
       setSyncDialog({
         open: true,
@@ -3179,6 +3560,7 @@ function App() {
         preview_session_id: defaultPreviewSessionId,
         strategy: "turn_3",
         selected_session_ids: defaultSelectedSessionIds,
+        included_entry_ids: [],
         excluded_entry_ids: [],
         preview_query: "",
         preview_kind: "all",
@@ -3188,10 +3570,9 @@ function App() {
         entries: []
       });
       try {
-        await Promise.all([
-          reloadSyncSessionList(paneId, undefined, defaultPreviewSessionId),
-          ...defaultSelectedSessionIds.map((sid) => ensureSyncDialogSessionLoaded(paneId, sid))
-        ]);
+        if (initialSessionItems.length === 0) {
+          await reloadSyncSessionList(paneId, undefined, defaultPreviewSessionId);
+        }
         setSyncDialog((current) => {
           if (!current.open || current.pane_id !== paneId) {
             return current;
@@ -3211,7 +3592,7 @@ function App() {
         setSyncSessionListState((current) => ({ ...current, loading: false }));
       }
     },
-    [messageApi, panes]
+    [getSessionListPanelState, messageApi, panes]
   );
 
   const reloadSyncDialogEntries = useCallback(async () => {
@@ -3260,26 +3641,40 @@ function App() {
       const sid = sessionId.trim();
       setSyncDialog((current) => {
         const nextSet = new Set(current.selected_session_ids);
+        const nextIncluded = new Set(current.included_entry_ids);
+        const nextExcluded = new Set(current.excluded_entry_ids);
+        const sessionEntries = collectSyncSelectableSessionEntries(
+          current.entries,
+          sid,
+          syncDialogCurrentSessionId,
+          current.strategy,
+          current.preview_kind,
+          current.preview_query.trim().toLowerCase()
+        );
         if (checked) {
           nextSet.add(sid);
+          for (const entry of sessionEntries) {
+            nextExcluded.delete(entry.id);
+          }
+          for (const entry of sessionEntries) {
+            nextIncluded.delete(entry.id);
+          }
         } else {
           nextSet.delete(sid);
+          for (const entry of sessionEntries) {
+            nextExcluded.add(entry.id);
+            nextIncluded.delete(entry.id);
+          }
         }
         return {
           ...current,
           selected_session_ids: [...nextSet],
-          excluded_entry_ids: checked ? current.excluded_entry_ids : current.excluded_entry_ids
+          included_entry_ids: [...nextIncluded],
+          excluded_entry_ids: [...nextExcluded]
         };
       });
-
-      if (checked && syncDialog.pane_id) {
-        void ensureSyncDialogSessionLoaded(syncDialog.pane_id, sid).catch((error) => {
-          console.error(error);
-          messageApi.error("加载选中会话消息失败");
-        });
-      }
     },
-    [messageApi, syncDialog.pane_id]
+    [syncDialogCurrentSessionId]
   );
 
   const setSyncDialogPreviewSession = useCallback((sessionId: string) => {
@@ -3289,20 +3684,57 @@ function App() {
     }));
   }, []);
 
-  const toggleSyncDialogEntryExcluded = useCallback((entryId: string, excluded: boolean) => {
-    setSyncDialog((current) => {
-      const next = new Set(current.excluded_entry_ids);
-      if (excluded) {
-        next.add(entryId);
-      } else {
-        next.delete(entryId);
-      }
-      return {
-        ...current,
-        excluded_entry_ids: [...next]
-      };
-    });
-  }, []);
+  const toggleSyncDialogEntryExcluded = useCallback(
+    (entryId: string, excluded: boolean) => {
+      setSyncDialog((current) => {
+        const targetEntry = current.entries.find((entry) => entry.id === entryId);
+        if (!targetEntry) {
+          return current;
+        }
+
+        const sessionId = resolveEntrySessionId(targetEntry, syncDialogCurrentSessionId);
+        const nextSelected = new Set(current.selected_session_ids);
+        const nextExcluded = new Set(current.excluded_entry_ids);
+        const nextIncluded = new Set(current.included_entry_ids);
+        const sessionEntries = collectSyncSelectableSessionEntries(
+          current.entries,
+          sessionId,
+          syncDialogCurrentSessionId,
+          current.strategy,
+          current.preview_kind,
+          current.preview_query.trim().toLowerCase()
+        );
+
+        if (excluded) {
+          if (sessionId && nextSelected.has(sessionId)) {
+            nextExcluded.add(entryId);
+            if (
+              sessionEntries.length > 0 &&
+              sessionEntries.every((entry) => nextExcluded.has(entry.id))
+            ) {
+              nextSelected.delete(sessionId);
+            }
+          } else {
+            nextIncluded.delete(entryId);
+          }
+        } else {
+          if (sessionId && nextSelected.has(sessionId)) {
+            nextExcluded.delete(entryId);
+          } else {
+            nextIncluded.add(entryId);
+          }
+        }
+
+        return {
+          ...current,
+          selected_session_ids: [...nextSelected],
+          included_entry_ids: [...nextIncluded],
+          excluded_entry_ids: [...nextExcluded]
+        };
+      });
+    },
+    [syncDialogCurrentSessionId]
+  );
 
   const excludeSyncDialogSessionGroup = useCallback(
     (sessionId: string) => {
@@ -3313,7 +3745,11 @@ function App() {
           }
           return {
             ...current,
-            selected_session_ids: current.selected_session_ids.filter((sid) => sid !== sessionId)
+            selected_session_ids: current.selected_session_ids.filter((sid) => sid !== sessionId),
+            included_entry_ids: current.included_entry_ids.filter((id) => {
+              const entry = current.entries.find((item) => item.id === id);
+              return entry ? resolveEntrySessionId(entry, syncDialogCurrentSessionId) !== sessionId : true;
+            })
           };
         }
         const ids = syncDialogFilteredEntriesAllSessions
@@ -3354,6 +3790,10 @@ function App() {
           return {
             ...current,
             selected_session_ids: [...nextSelected],
+            included_entry_ids: current.included_entry_ids.filter((id) => {
+              const entry = current.entries.find((item) => item.id === id);
+              return entry ? resolveEntrySessionId(entry, syncDialogCurrentSessionId) !== sessionId : true;
+            }),
             excluded_entry_ids: [...excludedSet]
           };
         }
@@ -3382,16 +3822,38 @@ function App() {
       if (!syncDialogFilteredEntries.length) {
         return current;
       }
+      const idSet = new Set(syncDialogFilteredEntries.map((entry) => entry.id));
       const next = new Set(current.excluded_entry_ids);
+      const nextSelected = new Set(current.selected_session_ids);
+      const touchedSessions = new Set<string>();
       for (const entry of syncDialogFilteredEntries) {
         next.add(entry.id);
+        const sid = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+        if (sid) {
+          touchedSessions.add(sid);
+        }
+      }
+      for (const sessionId of touchedSessions) {
+        const sessionEntries = collectSyncSelectableSessionEntries(
+          current.entries,
+          sessionId,
+          syncDialogCurrentSessionId,
+          current.strategy,
+          current.preview_kind,
+          current.preview_query.trim().toLowerCase()
+        );
+        if (sessionEntries.length > 0 && sessionEntries.every((entry) => next.has(entry.id))) {
+          nextSelected.delete(sessionId);
+        }
       }
       return {
         ...current,
+        selected_session_ids: [...nextSelected],
+        included_entry_ids: current.included_entry_ids.filter((id) => !idSet.has(id)),
         excluded_entry_ids: [...next]
       };
     });
-  }, [syncDialogFilteredEntries]);
+  }, [syncDialogCurrentSessionId, syncDialogFilteredEntries]);
 
   const includeSyncDialogFilteredEntries = useCallback(() => {
     setSyncDialog((current) => {
@@ -3399,63 +3861,53 @@ function App() {
         return current;
       }
       const idSet = new Set(syncDialogFilteredEntries.map((entry) => entry.id));
+      const nextSelected = new Set(current.selected_session_ids);
+      for (const entry of syncDialogFilteredEntries) {
+        const sid = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+        if (sid) {
+          nextSelected.add(sid);
+        }
+      }
       return {
         ...current,
+        selected_session_ids: [...nextSelected],
+        included_entry_ids: current.included_entry_ids.filter((id) => !idSet.has(id)),
         excluded_entry_ids: current.excluded_entry_ids.filter((id) => !idSet.has(id))
       };
     });
-  }, [syncDialogFilteredEntries]);
+  }, [syncDialogCurrentSessionId, syncDialogFilteredEntries]);
 
   const copySyncDialogMessages = useCallback(async () => {
-    if (!syncDialogPreviewEntries.length) {
+    const paneId = syncDialog.pane_id;
+    if (!paneId) {
+      return;
+    }
+    const loadedEntries = await ensureSyncDialogSessionsLoaded(
+      paneId,
+      syncDialog.selected_session_ids,
+      true
+    );
+    const selectedPreviewEntries = collectSyncDialogSelectedEntries(loadedEntries);
+
+    if (!selectedPreviewEntries.length) {
       messageApi.info("暂无可复制消息");
       return;
     }
 
-    const truncatedSelections: NativeSessionMessageSelection[] = syncDialogPreviewEntries
-      .filter((entry) => entry.preview_truncated)
-      .map((entry) => ({
-        messageId: entry.id,
-        sessionId: resolveEntrySessionId(entry, syncDialogCurrentSessionId) || ""
-      }))
-      .filter((entry) => entry.sessionId);
-
-    const detailMap = new Map<string, string>();
-    if (truncatedSelections.length) {
-      const details = await invoke<NativeSessionMessageDetailResponse[]>(
-        "get_native_session_message_details",
-        {
-          paneId: syncDialog.pane_id,
-          messages: truncatedSelections
-        }
-      );
-      for (const detail of details) {
-        detailMap.set(detail.message_id, detail.content || "");
-      }
-    }
-
-    const resolvedRows = syncDialogPreviewEntries.map((entry) => {
-      const role = entry.kind === "input" ? "user" : entry.kind === "output" ? "assistant" : entry.kind;
-      const sessionId = resolveEntrySessionId(entry, syncDialogCurrentSessionId) || "";
-      const content = detailMap.get(entry.id) ?? entry.content;
-      return JSON.stringify({
-        role,
-        session_id: sessionId,
-        created_at: entry.created_at,
-        content: content.replace(/\r\n/g, "\n").trim()
-      });
-    });
-
-    const payload = resolvedRows.join("\n");
+    const payload = await buildSyncDialogPlainPayload(selectedPreviewEntries);
 
     try {
       await copyTextToClipboard(payload);
-      messageApi.success(`已复制 ${syncDialogPreviewEntries.length} 条消息到剪贴板`);
+      messageApi.success(`已复制 ${selectedPreviewEntries.length} 条消息到剪贴板`);
     } catch (error) {
       console.error(error);
       messageApi.error("复制消息失败");
     }
-  }, [messageApi, syncDialog.pane_id, syncDialogCurrentSessionId, syncDialogPreviewEntries]);
+  }, [
+    messageApi,
+    syncDialog.pane_id,
+    syncDialog.selected_session_ids
+  ]);
 
   const mapNativePreviewRowsToEntries = useCallback(
     (paneId: string, sessionId: string, rows: NativeSessionPreviewRow[]): EntryRecord[] =>
@@ -3518,6 +3970,216 @@ function App() {
     [loadSyncDialogSessionEntries, mergeSyncDialogCachedEntries]
   );
 
+  const collectSyncDialogSelectedEntries = useCallback(
+    (entries: EntryRecord[]) => {
+      const selectedSet = new Set(syncDialog.selected_session_ids);
+      const excludedSet = new Set(syncDialog.excluded_entry_ids);
+      const includedSet = new Set(syncDialog.included_entry_ids);
+      return entries.filter((entry) => {
+        const sid = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+        if (sid && selectedSet.has(sid)) {
+          return !excludedSet.has(entry.id);
+        }
+        return includedSet.has(entry.id);
+      });
+    },
+    [
+      syncDialog.excluded_entry_ids,
+      syncDialog.included_entry_ids,
+      syncDialog.selected_session_ids,
+      syncDialogCurrentSessionId
+    ]
+  );
+
+  const ensureSyncDialogSessionsLoaded = useCallback(
+    async (paneId: string, sessionIds: string[], force = false): Promise<EntryRecord[]> => {
+      const explicitIncludedSessionIds = syncDialog.included_entry_ids
+        .map((id) => syncDialog.entries.find((entry) => entry.id === id))
+        .filter((entry): entry is EntryRecord => Boolean(entry))
+        .map((entry) => resolveEntrySessionId(entry, syncDialogCurrentSessionId));
+      const ids = parseSessionIds([...sessionIds, ...explicitIncludedSessionIds]);
+      if (!paneId || !ids.length) {
+        return [];
+      }
+
+      await Promise.all(ids.map((sid) => ensureSyncDialogSessionLoaded(paneId, sid, force)));
+      return [...syncDialogEntryCacheRef.current.values()].flat().sort(compareEntryByTime);
+    },
+    [ensureSyncDialogSessionLoaded, syncDialog.entries, syncDialog.included_entry_ids, syncDialogCurrentSessionId]
+  );
+
+  const buildSyncDialogPlainPayload = useCallback(
+    async (entries: EntryRecord[]) => {
+      if (!entries.length) {
+        return "";
+      }
+
+      return entries
+        .map((entry) => {
+          const content = sanitizeSyncPlainTextContent(entry.content);
+          if (!content) {
+            return "";
+          }
+          const rolePrefix =
+            entry.kind === "input"
+              ? "用户"
+              : entry.kind === "output"
+                ? "助手"
+                : entry.kind.trim() || "消息";
+          return `${rolePrefix}: ${content}`;
+        })
+        .filter((content) => content.length > 0)
+        .join("\n");
+    },
+    []
+  );
+
+  const mapEntriesToPreviewRows = useCallback(
+    (entries: EntryRecord[]): NativeSessionPreviewRow[] =>
+      entries.map((entry) => ({
+        id: entry.id,
+        kind: entry.kind,
+        content: entry.content,
+        created_at: entry.created_at,
+        preview_truncated: Boolean(entry.preview_truncated)
+      })),
+    []
+  );
+
+  const loadSyncDialogPreviewSession = useCallback(
+    async (paneId: string, sessionId: string, requestedLimit = 10, fromEnd = false) => {
+      const sid = sessionId.trim();
+      if (!paneId || !sid) {
+        setSyncDialogPreview(createSyncDialogPreviewState());
+        return;
+      }
+
+      const ticket = syncDialogPreviewTicketRef.current + 1;
+      syncDialogPreviewTicketRef.current = ticket;
+      setSyncDialogPreview((current) => ({
+        ...current,
+        preview_session_id: sid,
+        preview_loading: true
+      }));
+
+      try {
+        const response = await invoke<NativeSessionPreviewResponse>("preview_native_session_messages", {
+          paneId,
+          sessionId: sid,
+          limit: requestedLimit,
+          loadAll: false,
+          fromEnd
+        });
+        const mappedRows = mapNativePreviewRowsToEntries(paneId, sid, response.rows || []);
+        const existingRows = syncDialogEntryCacheRef.current.get(sid) || [];
+        const mergedRows = [...existingRows, ...mappedRows]
+          .filter((entry, index, list) => list.findIndex((item) => item.id === entry.id) === index)
+          .sort(compareEntryByTime);
+        syncDialogEntryCacheRef.current.set(sid, mergedRows);
+        mergeSyncDialogCachedEntries(paneId);
+        if (syncDialogPreviewTicketRef.current !== ticket) {
+          return;
+        }
+        setSyncDialogPreview({
+          preview_session_id: sid,
+          preview_loading: false,
+          preview_rows: response.rows || [],
+          preview_total_rows: Number(response.total_rows || 0),
+          preview_loaded_rows: Number(response.loaded_rows || 0),
+          preview_has_more: Boolean(response.has_more),
+          preview_from_end: fromEnd
+        });
+      } catch (error) {
+        if (syncDialogPreviewTicketRef.current !== ticket) {
+          return;
+        }
+        console.error(error);
+        setSyncDialogPreview((current) => ({ ...current, preview_loading: false }));
+        messageApi.error("加载同步预览失败");
+      }
+    },
+    [mapNativePreviewRowsToEntries, mergeSyncDialogCachedEntries, messageApi]
+  );
+
+  const loadMoreSyncDialogPreviewRows = useCallback(async () => {
+    const paneId = syncDialog.pane_id;
+    const sessionId = syncDialogPreview.preview_session_id.trim();
+    if (!paneId || !sessionId || syncDialogPreview.preview_loading || !syncDialogPreview.preview_has_more) {
+      return;
+    }
+    await loadSyncDialogPreviewSession(
+      paneId,
+      sessionId,
+      Math.max(10, syncDialogPreview.preview_loaded_rows + 10),
+      syncDialogPreview.preview_from_end
+    );
+  }, [
+    loadSyncDialogPreviewSession,
+    syncDialog.pane_id,
+    syncDialogPreview.preview_from_end,
+    syncDialogPreview.preview_has_more,
+    syncDialogPreview.preview_loading,
+    syncDialogPreview.preview_session_id
+  ]);
+
+  const jumpSyncDialogPreviewToStart = useCallback(async () => {
+    const paneId = syncDialog.pane_id;
+    const sid = syncDialogPreview.preview_session_id.trim();
+    if (paneId && sid) {
+      await loadSyncDialogPreviewSession(paneId, sid, 10, false);
+      return;
+    }
+    setSyncDialogPreviewScrollCommand((current) => ({
+      target: "top",
+      nonce: (current?.nonce || 0) + 1
+    }));
+  }, [loadSyncDialogPreviewSession, syncDialog.pane_id, syncDialogPreview.preview_session_id]);
+
+  const jumpSyncDialogPreviewToLatest = useCallback(async () => {
+    const paneId = syncDialog.pane_id;
+    const sid = syncDialogPreview.preview_session_id.trim();
+    if (paneId && sid) {
+      const loadedEntries = await ensureSyncDialogSessionLoaded(paneId, sid);
+      const sessionEntries = collectSyncSelectableSessionEntries(
+        loadedEntries,
+        sid,
+        syncDialogCurrentSessionId,
+        syncDialog.strategy,
+        syncDialog.preview_kind,
+        syncDialog.preview_query.trim().toLowerCase()
+      ).sort(compareEntryByTime);
+      const latestEntries = sessionEntries.slice(-10);
+      setSyncDialogPreview({
+        preview_session_id: sid,
+        preview_loading: false,
+        preview_rows: mapEntriesToPreviewRows(latestEntries),
+        preview_total_rows: sessionEntries.length,
+        preview_loaded_rows: latestEntries.length,
+        preview_has_more: latestEntries.length < sessionEntries.length,
+        preview_from_end: true
+      });
+      setSyncDialogPreviewScrollCommand((current) => ({
+        target: "bottom",
+        nonce: (current?.nonce || 0) + 1
+      }));
+      return;
+    }
+    setSyncDialogPreviewScrollCommand((current) => ({
+      target: "bottom",
+      nonce: (current?.nonce || 0) + 1
+    }));
+  }, [
+    collectSyncSelectableSessionEntries,
+    ensureSyncDialogSessionLoaded,
+    mapEntriesToPreviewRows,
+    syncDialog.pane_id,
+    syncDialog.preview_kind,
+    syncDialog.preview_query,
+    syncDialog.strategy,
+    syncDialogCurrentSessionId,
+    syncDialogPreview.preview_session_id
+  ]);
+
   const previewSyncDialogSession = useCallback(
     async (paneId: string, sessionId: string) => {
       const sid = sessionId.trim();
@@ -3526,7 +4188,7 @@ function App() {
       }
       setSyncDialog((current) => ({ ...current, loading: true }));
       try {
-        await ensureSyncDialogSessionLoaded(paneId, sid);
+        await loadSyncDialogPreviewSession(paneId, sid, 10, true);
         setSyncDialog((current) => ({
           ...current,
           loading: false,
@@ -3538,7 +4200,7 @@ function App() {
         messageApi.error("加载会话预览失败");
       }
     },
-    [ensureSyncDialogSessionLoaded, messageApi]
+    [loadSyncDialogPreviewSession, messageApi]
   );
 
   function renderSyncDialogSessionToolbar() {
@@ -3733,8 +4395,19 @@ function App() {
       messageApi.warning("请先选择目标窗格");
       return;
     }
-    if (!syncDialogPreviewEntries.length) {
+    const loadedEntries = await ensureSyncDialogSessionsLoaded(
+      paneId,
+      syncDialog.selected_session_ids,
+      true
+    );
+    const selectedPreviewEntries = collectSyncDialogSelectedEntries(loadedEntries);
+    if (!selectedPreviewEntries.length) {
       messageApi.warning("当前预览无可同步内容");
+      return;
+    }
+    const payload = await buildSyncDialogPlainPayload(selectedPreviewEntries);
+    if (!payload.trim()) {
+      messageApi.warning("当前选中消息为空");
       return;
     }
     setSyncDialog((current) => ({
@@ -3751,13 +4424,9 @@ function App() {
         progress_percent: 75,
         progress_text: syncProgressText("syncing")
       }));
-      await invoke<EntryRecord>("sync_native_session_messages", {
-        paneId,
+      await invoke<void>("sync_text_payload", {
         targetPaneId,
-        messages: syncDialogPreviewEntries.map((entry) => ({
-          messageId: entry.id,
-          sessionId: resolveEntrySessionId(entry, syncDialogCurrentSessionId)
-        }))
+        payload
       });
       setSyncDialog((current) => ({
         ...current,
@@ -3767,7 +4436,7 @@ function App() {
         progress_text: syncProgressText("done")
       }));
       messageApi.success(
-        `同步完成：${syncDialogPreviewEntries.length} 条记录 -> ${
+        `同步完成：${selectedPreviewEntries.length} 条记录 -> ${
           panes.find((item) => item.id === targetPaneId)?.title || "目标窗格"
         }`
       );
@@ -3788,8 +4457,7 @@ function App() {
     syncDialog.open,
     syncDialog.pane_id,
     syncDialog.target_pane_id,
-    syncDialogCurrentSessionId,
-    syncDialogPreviewEntries
+    syncDialog.selected_session_ids
   ]);
 
   const openSendDialog = useCallback((paneId: string) => {
@@ -4725,6 +5393,34 @@ function App() {
     }
   }, [getSessionListPanelState, loadSessionListPreview, panes]);
 
+  useEffect(() => {
+    const activePreviewTargets = panes
+      .map((pane) => ({
+        pane_id: pane.id,
+        active_session_id: pane.active_session_id.trim(),
+        panel: getSessionListPanelState(pane.id)
+      }))
+      .filter(
+        (item) =>
+          item.panel.open &&
+          item.active_session_id &&
+          !item.panel.preview_loading &&
+          item.panel.preview_session_id.trim() === item.active_session_id
+      );
+
+    if (!activePreviewTargets.length) {
+      return undefined;
+    }
+
+    const timer = window.setInterval(() => {
+      for (const item of activePreviewTargets) {
+        void loadSessionListPreview(item.pane_id, item.active_session_id, false);
+      }
+    }, 4000);
+
+    return () => window.clearInterval(timer);
+  }, [getSessionListPanelState, loadSessionListPreview, panes]);
+
   const loadMoreSessionListDialog = useCallback(
     async (paneId: string) => {
       const panel = getSessionListPanelState(paneId);
@@ -5257,27 +5953,6 @@ function App() {
                             <Typography.Text type="secondary">
                               已加载 {inlinePreviewLoadedRows}/{inlinePreviewTotalRows}
                             </Typography.Text>
-                            <Button
-                              size="small"
-                              onClick={() => {
-                                if (!inlinePreviewSessionId) {
-                                  messageApi.warning("请先绑定当前 SID");
-                                  return;
-                                }
-                                void previewSessionListCandidate(pane.id, inlinePreviewSessionId);
-                              }}
-                              loading={sessionListDialog.preview_loading}
-                            >
-                              刷新预览
-                            </Button>
-                            <Button
-                              size="small"
-                              onClick={() => void loadSessionListPreview(pane.id, inlinePreviewSessionId, true)}
-                              loading={sessionListDialog.preview_loading}
-                              disabled={!inlinePreviewSessionId || !inlinePreviewHasMore}
-                            >
-                              加载全部
-                            </Button>
                           </Space>
                         </div>
 
@@ -5291,6 +5966,7 @@ function App() {
                               show_checkbox={false}
                               user_avatar_src={userAvatarSrc}
                               assistant_avatar_src={assistantAvatarSrc}
+                              auto_follow_bottom
                               items={inlinePreviewRows.map((row, index) => ({
                                 id: row.id || `${row.created_at}-${index}-${row.kind}`,
                                 kind: row.kind,
@@ -5553,13 +6229,15 @@ function App() {
         open={createPaneDialog.open}
         onCancel={() => {
           setCreatePanePathTarget("rule_content_text_paths");
+          setCreatePaneSampleViewMode("root");
           setCreatePaneSamplePreview({
             loading: false,
             error: "",
             parser_profile: "",
             file_path: "",
             file_format: "",
-            sample_value: null
+            sample_value: null,
+            message_sample_value: null
           });
           setCreatePaneDialog(
             createCreatePaneDialogState(activePane?.provider || providers[0] || "codex", sessionParserProfiles)
@@ -5654,7 +6332,16 @@ function App() {
               />
             </Form.Item>
           ) : null}
-          <Form.Item label="标题模式">
+          <Collapse
+            size="small"
+            ghost
+            items={[
+              {
+                key: "advanced",
+                label: "高级选项",
+                children: (
+                  <Form layout="vertical">
+                    <Form.Item label="标题模式">
             <Segmented
               value={createPaneDialog.title_mode}
               options={[
@@ -5668,8 +6355,8 @@ function App() {
                 }))
               }
             />
-          </Form.Item>
-          <Form.Item label="自动标题预览">
+                    </Form.Item>
+                    <Form.Item label="自动标题预览">
             <Typography.Text code>
               {buildAutoPaneTitle(
                 createPaneDialog.provider_mode === "preset"
@@ -5678,9 +6365,9 @@ function App() {
                 panes
               )}
             </Typography.Text>
-          </Form.Item>
-          {createPaneDialog.title_mode === "custom" ? (
-            <Form.Item label="自定义标题">
+                    </Form.Item>
+                    {createPaneDialog.title_mode === "custom" ? (
+                      <Form.Item label="自定义标题">
               <Input
                 value={createPaneDialog.custom_title}
                 onChange={(event) =>
@@ -5691,9 +6378,9 @@ function App() {
                 }
                 placeholder="终端标题"
               />
-            </Form.Item>
-          ) : null}
-          <Form.Item
+                      </Form.Item>
+                    ) : null}
+                    <Form.Item
             label={createPaneDialog.provider_mode === "custom" ? "扫描会话通配路径（必填）" : "扫描会话通配符"}
             extra="使用绝对路径通配模式，支持 * 和 ?；可填写多个模式（空格/逗号/分号/换行分隔），填写后会自动纠正格式，并按后缀自动识别文件类型。"
           >
@@ -5716,9 +6403,9 @@ function App() {
                   ? "例如: D:/logs/my-model/**/*.jsonl"
                   : "~/.codex/sessions/**/rollout-*.jsonl"
               }
-            />
-          </Form.Item>
-          <Form.Item
+              />
+                    </Form.Item>
+                    <Form.Item
             label="解析配置（图形编辑）"
             extra="Provider 与解析配置一对一绑定；文件格式将根据扫描通配符自动识别。"
           >
@@ -5751,6 +6438,21 @@ function App() {
                 title="样本 JSON 路径选择"
                 extra={
                   <Space size={8}>
+                    <Button
+                      size="small"
+                      type={createPaneSampleViewMode === "root" ? "primary" : "default"}
+                      onClick={() => setCreatePaneSampleViewMode("root")}
+                    >
+                      原始 JSON
+                    </Button>
+                    <Button
+                      size="small"
+                      type={createPaneSampleViewMode === "message" ? "primary" : "default"}
+                      onClick={() => setCreatePaneSampleViewMode("message")}
+                      disabled={!createPaneSamplePreview.message_sample_value}
+                    >
+                      原始消息
+                    </Button>
                     <Tag color="cyan">{createPanePathTargetLabel(createPanePathTarget)}</Tag>
                     <Button
                       size="small"
@@ -5780,7 +6482,7 @@ function App() {
                     </div>
                   ) : createPaneSamplePreview.sample_value ? (
                     <JsonPathTree
-                      value={createPaneSamplePreview.sample_value}
+                      value={createPaneDisplayedSampleValue}
                       maxExpandDepth={2}
                       onSelectPath={(pathTokens) => applyCreatePanePathToTarget(pathTokens)}
                     />
@@ -5793,7 +6495,7 @@ function App() {
               <Card size="small" title="会话层（Session）">
                 <div style={{ display: "grid", gap: 12 }}>
                   <div>
-                    <Typography.Text strong>会话 ID 路径（session_id_paths）</Typography.Text>
+                    {renderCreatePanePathFieldTitle("会话 ID 路径（session_id_paths）", "session_id_paths")}
                     <Typography.Text type="secondary" style={{ display: "block" }}>
                       从会话元信息里提取 SID，可填多个兜底路径。
                     </Typography.Text>
@@ -5812,7 +6514,7 @@ function App() {
                     />
                   </div>
                   <div>
-                    <Typography.Text strong>会话时间路径（started_at_paths）</Typography.Text>
+                    {renderCreatePanePathFieldTitle("会话时间路径（started_at_paths）", "started_at_paths")}
                     <Typography.Text type="secondary" style={{ display: "block" }}>
                       从会话元信息里提取会话开始时间。
                     </Typography.Text>
@@ -5836,7 +6538,7 @@ function App() {
               <Card size="small" title="消息层（Message）">
                 <div style={{ display: "grid", gap: 12 }}>
                   <div>
-                    <Typography.Text strong>消息角色路径（role_path）</Typography.Text>
+                    {renderCreatePanePathFieldTitle("消息角色路径（role_path）", "rule_role_path")}
                     <Typography.Text type="secondary" style={{ display: "block" }}>
                       用于判定 input/output 角色的字段路径。
                     </Typography.Text>
@@ -5851,7 +6553,7 @@ function App() {
                     />
                   </div>
                   <div>
-                    <Typography.Text strong>消息文本路径（content_text_paths）</Typography.Text>
+                    {renderCreatePanePathFieldTitle("消息文本路径（content_text_paths）", "rule_content_text_paths")}
                     <Typography.Text type="secondary" style={{ display: "block" }}>
                       从消息对象中提取正文文本的字段路径。
                     </Typography.Text>
@@ -5874,7 +6576,7 @@ function App() {
                     />
                   </div>
                   <div>
-                    <Typography.Text strong>消息时间路径（timestamp_paths）</Typography.Text>
+                    {renderCreatePanePathFieldTitle("消息时间路径（timestamp_paths）", "rule_timestamp_paths")}
                     <Typography.Text type="secondary" style={{ display: "block" }}>
                       可选，单条消息时间戳路径。
                     </Typography.Text>
@@ -5898,7 +6600,7 @@ function App() {
               <Card size="small" title="兼容项">
                 <div style={{ display: "grid", gap: 12 }}>
                   <div>
-                    <Typography.Text strong>消息容器路径（message_source_path）</Typography.Text>
+                    {renderCreatePanePathFieldTitle("消息容器路径（message_source_path）", "message_source_path")}
                     <Typography.Text type="secondary" style={{ display: "block" }}>
                       可选。消息不是平铺时可指定父节点路径。
                     </Typography.Text>
@@ -5913,7 +6615,7 @@ function App() {
                     />
                   </div>
                   <div>
-                    <Typography.Text strong>消息项路径（content_item_path）</Typography.Text>
+                    {renderCreatePanePathFieldTitle("消息项路径（content_item_path）", "rule_content_item_path")}
                     <Typography.Text type="secondary" style={{ display: "block" }}>
                       可选。消息正文为数组结构时填写。
                     </Typography.Text>
@@ -5932,7 +6634,7 @@ function App() {
                     />
                   </div>
                   <div>
-                    <Typography.Text strong>消息项过滤路径（content_item_filter_path）</Typography.Text>
+                    {renderCreatePanePathFieldTitle("消息项过滤路径（content_item_filter_path）", "rule_content_item_filter_path")}
                     <Typography.Text type="secondary" style={{ display: "block" }}>
                       可选。用于过滤消息数组项类型。
                     </Typography.Text>
@@ -6030,11 +6732,11 @@ function App() {
                 </div>
               </Card>
             </Space>
-          </Form.Item>
-          <Form.Item label="自动生成 JSON（只读）" extra="由上方图形项自动生成，创建时直接提交。">
+                    </Form.Item>
+                    <Form.Item label="自动生成 JSON（只读）" extra="由上方图形项自动生成，创建时直接提交。">
             <Input.TextArea value={createPaneParserJsonPreview} readOnly autoSize={{ minRows: 8, maxRows: 14 }} />
-          </Form.Item>
-          <Form.Item label="创建参数预览">
+                    </Form.Item>
+                    <Form.Item label="创建参数预览">
             <Typography.Text type="secondary">
               Provider:{" "}
               {createPaneDialog.provider_mode === "preset"
@@ -6042,7 +6744,12 @@ function App() {
                 : createPaneDialog.custom_provider.trim().toLowerCase() || "-"}
               {" | "}解析配置: 图形生成 JSON
             </Typography.Text>
-          </Form.Item>
+                    </Form.Item>
+                  </Form>
+                )
+              }
+            ]}
+          />
         </Form>
       </Modal>
 
@@ -6692,10 +7399,22 @@ function App() {
             <Button onClick={() => closeSyncDialog()} disabled={syncDialog.syncing}>
               取消
             </Button>
+            <Select
+              value={syncDialog.target_pane_id || undefined}
+              onChange={(value) =>
+                setSyncDialog((current) => ({
+                  ...current,
+                  target_pane_id: String(value || "")
+                }))
+              }
+              placeholder="选择目标窗格"
+              options={syncDialogTargetOptions}
+              style={{ width: 260 }}
+            />
             <Button
               icon={<CopyOutlined />}
               onClick={() => void copySyncDialogMessages()}
-              disabled={syncDialog.loading || !syncDialogPreviewEntries.length}
+              disabled={syncDialog.loading || !syncDialogPendingEntryCount}
             >
               复制消息
             </Button>
@@ -6703,117 +7422,13 @@ function App() {
               type="primary"
               onClick={() => void submitSyncDialog()}
               loading={syncDialog.syncing}
-              disabled={syncDialogPreviewEntries.length === 0 || !syncDialog.target_pane_id.trim()}
+              disabled={syncDialogPendingEntryCount === 0 || !syncDialog.target_pane_id.trim()}
             >
               开始同步
             </Button>
           </Space>
         }
       >
-        <div className="sync-dialog-toolbar">
-          <Select
-            value={syncDialog.strategy}
-            onChange={(value) =>
-              setSyncDialog((current) => ({
-                ...current,
-                strategy: (value as SyncStrategy) || "turn_3",
-                selected_session_ids:
-                  ((value as SyncStrategy) || "turn_3") !== "all" &&
-                  syncDialogCurrentSessionId &&
-                  current.selected_session_ids.length === syncDialogAllSessionIds.length &&
-                  syncDialogAllSessionIds.length > 1
-                    ? [syncDialogCurrentSessionId]
-                    : current.selected_session_ids,
-                excluded_entry_ids: [],
-                progress_stage: "idle",
-                progress_percent: 0,
-                progress_text: syncProgressText("idle")
-              }))
-            }
-            options={[
-              { value: "turn_1", label: "最近 1 轮" },
-              { value: "turn_3", label: "最近 3 轮" },
-              { value: "turn_5", label: "最近 5 轮" },
-              { value: "latest_qa", label: "最新一问一答" },
-              { value: "all", label: "全部记录" }
-            ]}
-            style={{ width: 180 }}
-          />
-          <Select
-            value={syncDialog.target_pane_id || undefined}
-            onChange={(value) =>
-              setSyncDialog((current) => ({
-                ...current,
-                target_pane_id: String(value || "")
-              }))
-            }
-            placeholder="选择目标窗格"
-            options={syncDialogTargetOptions}
-            style={{ width: 280 }}
-          />
-          <Input
-            allowClear
-            value={syncDialog.preview_query}
-            onChange={(event) =>
-              setSyncDialog((current) => ({
-                ...current,
-                preview_query: event.target.value
-              }))
-            }
-            placeholder="过滤预览内容"
-            style={{ width: 220 }}
-          />
-          <Select
-            value={syncDialog.preview_kind}
-            onChange={(value) =>
-              setSyncDialog((current) => ({
-                ...current,
-                preview_kind: (value as SyncPreviewKind) || "all"
-              }))
-            }
-            options={[
-              { value: "all", label: "全部类型" },
-              { value: "input", label: "仅输入" },
-              { value: "output", label: "仅输出" }
-            ]}
-            style={{ width: 120 }}
-          />
-          <Button onClick={() => void reloadSyncDialogEntries()} loading={syncDialog.loading}>
-            刷新预览
-          </Button>
-          <Button
-            onClick={() =>
-              setSyncDialog((current) => ({
-                ...current,
-                selected_session_ids: [...syncDialogAllSessionIds],
-                excluded_entry_ids: []
-              }))
-            }
-            disabled={!syncDialogAllSessionIds.length}
-          >
-            全选会话
-          </Button>
-          <Button
-            onClick={() =>
-              setSyncDialog((current) => ({
-                ...current,
-                selected_session_ids: [],
-                excluded_entry_ids: []
-              }))
-            }
-            disabled={!syncDialog.selected_session_ids.length}
-          >
-            清空会话
-          </Button>
-          <Button
-            type={syncShowSelectedOnly ? "primary" : "default"}
-            onClick={() => setSyncShowSelectedOnly((current) => !current)}
-            disabled={!syncDialog.selected_session_ids.length}
-          >
-            {syncShowSelectedOnly ? "显示全部会话" : "仅看已选会话"}
-          </Button>
-        </div>
-
         <div className="sync-dialog-progress">
           <Progress
             percent={syncDialog.progress_percent}
@@ -6835,10 +7450,10 @@ function App() {
         <div className="sync-dialog-summary">
           <Typography.Text type="secondary">
             策略：{syncStrategyLabel(syncDialog.strategy)} | 已选会话 {syncDialog.selected_session_ids.length}/
-            {syncDialogAllSessionIds.length} | 记录 {syncDialogScopedEntries.length} 条 | 分组{" "}
+            {syncDialogAllSessionIds.length} | 记录 {syncDialogSelectedRecordCount} 条 | 分组{" "}
             {syncDialogSessionGroups.length} 个 | 筛后{" "}
-            {syncDialogFilteredEntries.length} 条 | 取消 {syncDialogFilteredExcludedCount} 条 | 待同步{" "}
-            {syncDialogPreviewEntries.length} 条
+            {syncDialogFilteredEntries.length} 条 | 取消 {syncDialogExcludedSelectedCount} 条 | 待同步{" "}
+            {syncDialogPendingEntryCount} 条
           </Typography.Text>
         </div>
 
@@ -6855,6 +7470,42 @@ function App() {
                     当前 {syncDialogGroupedItems.current.length} | 关联 {syncDialogGroupedItems.linked.length} |
                     未关联 {syncDialogGroupedItems.unlinked.length}
                   </Typography.Text>
+                </div>
+
+                <div className="sync-selection-actions">
+                  <Button
+                    onClick={() => {
+                      setSyncDialog((current) => ({
+                        ...current,
+                        selected_session_ids: [...syncDialogAllSessionIds],
+                        included_entry_ids: [],
+                        excluded_entry_ids: []
+                      }));
+                    }}
+                    disabled={!syncDialogAllSessionIds.length}
+                  >
+                    全选会话
+                  </Button>
+                  <Button
+                    onClick={() =>
+                      setSyncDialog((current) => ({
+                        ...current,
+                        selected_session_ids: [],
+                        included_entry_ids: [],
+                        excluded_entry_ids: []
+                      }))
+                    }
+                    disabled={!syncDialog.selected_session_ids.length}
+                  >
+                    清空会话
+                  </Button>
+                  <Button
+                    type={syncShowSelectedOnly ? "primary" : "default"}
+                    onClick={() => setSyncShowSelectedOnly((current) => !current)}
+                    disabled={!syncDialog.selected_session_ids.length}
+                  >
+                    {syncShowSelectedOnly ? "显示全部会话" : "仅看已选会话"}
+                  </Button>
                 </div>
 
                 <div className="session-list-left sync-dialog-selection-list">
@@ -6877,22 +7528,29 @@ function App() {
                               {syncDialogGroupedItems.current.length ? (
                                 <div className="session-inline-group-list">
                                   {syncDialogGroupedItems.current.map((item) => (
+                                    (() => {
+                                      const badge = getSyncDialogSessionSelectionBadge(item.session_id);
+                                      return (
                                     <SessionCandidateCard
                                       key={item.session_id}
                                       session_id={item.session_id}
                                       sid_short={shortSessionId(item.session_id)}
-                                      selected={syncDialogSelectedSessionSet.has(item.session_id)}
+                                      selected={syncDialogVisualSelectedSessionSet.has(item.session_id)}
                                       previewing={syncDialogPreviewSessionId === item.session_id}
                                       created_text={formatTs(item.started_at)}
                                       updated_text={formatTs(item.last_seen_at)}
                                       record_count={item.record_count}
                                       source_files={item.source_files}
                                       first_input={item.first_input}
+                                      selection_status_text={badge?.text}
+                                      selection_status_color={badge?.color}
                                       on_toggle_selected={(checked) =>
                                         toggleSyncDialogSession(item.session_id, checked)
                                       }
                                       on_preview={() => void previewSyncDialogSession(syncDialog.pane_id, item.session_id)}
                                     />
+                                      );
+                                    })()
                                   ))}
                                 </div>
                               ) : (
@@ -6909,22 +7567,29 @@ function App() {
                               {syncDialogGroupedItems.linked.length ? (
                                 <div className="session-inline-group-list">
                                   {syncDialogGroupedItems.linked.map((item) => (
+                                    (() => {
+                                      const badge = getSyncDialogSessionSelectionBadge(item.session_id);
+                                      return (
                                     <SessionCandidateCard
                                       key={item.session_id}
                                       session_id={item.session_id}
                                       sid_short={shortSessionId(item.session_id)}
-                                      selected={syncDialogSelectedSessionSet.has(item.session_id)}
+                                      selected={syncDialogVisualSelectedSessionSet.has(item.session_id)}
                                       previewing={syncDialogPreviewSessionId === item.session_id}
                                       created_text={formatTs(item.started_at)}
                                       updated_text={formatTs(item.last_seen_at)}
                                       record_count={item.record_count}
                                       source_files={item.source_files}
                                       first_input={item.first_input}
+                                      selection_status_text={badge?.text}
+                                      selection_status_color={badge?.color}
                                       on_toggle_selected={(checked) =>
                                         toggleSyncDialogSession(item.session_id, checked)
                                       }
                                       on_preview={() => void previewSyncDialogSession(syncDialog.pane_id, item.session_id)}
                                     />
+                                      );
+                                    })()
                                   ))}
                                 </div>
                               ) : (
@@ -6941,22 +7606,29 @@ function App() {
                               {syncDialogGroupedItems.unlinked.length ? (
                                 <div className="session-inline-group-list">
                                   {syncDialogGroupedItems.unlinked.map((item) => (
+                                    (() => {
+                                      const badge = getSyncDialogSessionSelectionBadge(item.session_id);
+                                      return (
                                     <SessionCandidateCard
                                       key={item.session_id}
                                       session_id={item.session_id}
                                       sid_short={shortSessionId(item.session_id)}
-                                      selected={syncDialogSelectedSessionSet.has(item.session_id)}
+                                      selected={syncDialogVisualSelectedSessionSet.has(item.session_id)}
                                       previewing={syncDialogPreviewSessionId === item.session_id}
                                       created_text={formatTs(item.started_at)}
                                       updated_text={formatTs(item.last_seen_at)}
                                       record_count={item.record_count}
                                       source_files={item.source_files}
                                       first_input={item.first_input}
+                                      selection_status_text={badge?.text}
+                                      selection_status_color={badge?.color}
                                       on_toggle_selected={(checked) =>
                                         toggleSyncDialogSession(item.session_id, checked)
                                       }
                                       on_preview={() => void previewSyncDialogSession(syncDialog.pane_id, item.session_id)}
                                     />
+                                      );
+                                    })()
                                   ))}
                                 </div>
                               ) : (
@@ -6974,42 +7646,129 @@ function App() {
 
           <Card size="small" title="同步预览" className="sync-dialog-right">
             <div className="sync-preview-header">
-              <Typography.Text type="secondary">
-                预览会话：{syncDialogPreviewSessionId ? shortSessionId(syncDialogPreviewSessionId) : "已选会话汇总"}
-              </Typography.Text>
-              <Space size={6}>
-                <Button
-                  size="small"
-                  onClick={() =>
-                    setSyncDialog((current) => ({
-                      ...current,
-                      preview_session_id: "",
-                      preview_query: "",
-                      preview_kind: "all"
-                    }))
-                  }
-                  disabled={!syncDialog.selected_session_ids.length}
-                >
-                  查看已选全量
-                </Button>
-                <Button
-                  size="small"
-                  onClick={() => excludeSyncDialogFilteredEntries()}
-                  disabled={
-                    !syncDialogFilteredEntries.length ||
-                    syncDialogFilteredExcludedCount >= syncDialogFilteredEntries.length
-                  }
-                >
-                  全排除
-                </Button>
-                <Button
-                  size="small"
-                  onClick={() => includeSyncDialogFilteredEntries()}
-                  disabled={!syncDialogFilteredExcludedCount}
-                >
-                  全恢复
-                </Button>
-              </Space>
+              <div className="sync-preview-header-main">
+                <Space size={[8, 8]} wrap>
+                  <Typography.Text type="secondary">
+                    预览会话：{syncDialogPreviewSessionId ? shortSessionId(syncDialogPreviewSessionId) : "已选会话汇总"}
+                  </Typography.Text>
+                  <Tag color={syncDialogPreviewSessionId ? "blue" : "default"}>
+                    {syncDialogPreviewSelectionText}
+                  </Tag>
+                </Space>
+                <Space size={6} className="sync-preview-progress-actions" wrap>
+                  <Button size="small" onClick={() => void jumpSyncDialogPreviewToStart()}>
+                    回到起始
+                  </Button>
+                  <Button size="small" onClick={() => void jumpSyncDialogPreviewToLatest()}>
+                    回到最新
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      if (syncDialog.pane_id && syncDialog.selected_session_ids.length) {
+                        void ensureSyncDialogSessionsLoaded(
+                          syncDialog.pane_id,
+                          syncDialog.selected_session_ids
+                        ).catch((error) => {
+                          console.error(error);
+                          messageApi.error("加载已选会话消息失败");
+                        });
+                      }
+                      setSyncDialog((current) => ({
+                        ...current,
+                        preview_session_id: "",
+                        preview_query: "",
+                        preview_kind: "all"
+                      }));
+                    }}
+                    disabled={!syncDialog.selected_session_ids.length}
+                  >
+                    查看已选全量
+                  </Button>
+                </Space>
+              </div>
+              <div className="sync-preview-header-tools">
+                <Space size={6} className="sync-preview-filter-actions" wrap>
+                  <Select
+                    value={syncDialog.strategy}
+                    onChange={(value) =>
+                      setSyncDialog((current) => ({
+                        ...current,
+                        strategy: (value as SyncStrategy) || "turn_3",
+                        selected_session_ids:
+                          ((value as SyncStrategy) || "turn_3") !== "all" &&
+                          syncDialogCurrentSessionId &&
+                          current.selected_session_ids.length === syncDialogAllSessionIds.length &&
+                          syncDialogAllSessionIds.length > 1
+                            ? [syncDialogCurrentSessionId]
+                            : current.selected_session_ids,
+                        included_entry_ids: [],
+                        excluded_entry_ids: [],
+                        progress_stage: "idle",
+                        progress_percent: 0,
+                        progress_text: syncProgressText("idle")
+                      }))
+                    }
+                    options={[
+                      { value: "turn_1", label: "最近 1 轮" },
+                      { value: "turn_3", label: "最近 3 轮" },
+                      { value: "turn_5", label: "最近 5 轮" },
+                      { value: "latest_qa", label: "最新一问一答" },
+                      { value: "all", label: "全部记录" }
+                    ]}
+                    style={{ width: 160 }}
+                  />
+                  <Input
+                    allowClear
+                    value={syncDialog.preview_query}
+                    onChange={(event) =>
+                      setSyncDialog((current) => ({
+                        ...current,
+                        preview_query: event.target.value
+                      }))
+                    }
+                    placeholder="过滤预览内容"
+                    style={{ width: 220 }}
+                  />
+                  <Select
+                    value={syncDialog.preview_kind}
+                    onChange={(value) =>
+                      setSyncDialog((current) => ({
+                        ...current,
+                        preview_kind: (value as SyncPreviewKind) || "all"
+                      }))
+                    }
+                    options={[
+                      { value: "all", label: "全部类型" },
+                      { value: "input", label: "仅输入" },
+                      { value: "output", label: "仅输出" }
+                    ]}
+                    style={{ width: 120 }}
+                  />
+                  <Button onClick={() => void reloadSyncDialogEntries()} loading={syncDialog.loading}>
+                    刷新预览
+                  </Button>
+                </Space>
+                <Space size={6} className="sync-preview-batch-actions" wrap>
+                  <Button
+                    size="small"
+                    onClick={() => excludeSyncDialogFilteredEntries()}
+                    disabled={
+                      !(syncDialogPreviewSessionId ? syncDialogPreview.preview_rows.length : syncDialogFilteredEntries.length) ||
+                      syncDialogFilteredExcludedCount >= syncDialogFilteredEntries.length
+                    }
+                  >
+                    全排除
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => includeSyncDialogFilteredEntries()}
+                    disabled={!syncDialogFilteredExcludedCount}
+                  >
+                    全恢复
+                  </Button>
+                </Space>
+              </div>
             </div>
             {syncDialog.loading ? (
               <div className="sync-preview-loading">
@@ -7020,21 +7779,65 @@ function App() {
                 <SyncEntryPreviewList
                   user_avatar_src={userAvatarSrc}
                   assistant_avatar_src={assistantAvatarSrc}
-                  items={syncDialogPreviewPanelEntries.map((entry) => {
-                    const sessionId = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
-                    return {
-                      id: entry.id,
-                      kind: entry.kind,
-                      content: entry.content,
-                      created_at_text: formatTs(entry.created_at),
-                      sid_text: sessionId ? shortSessionId(sessionId) : "-",
-                      included: !syncDialogExcludedSet.has(entry.id)
-                    };
-                  })}
+                  scroll_command={syncDialogPreviewScrollCommand}
+                  items={
+                    syncDialogPreviewSessionId
+                      ? syncDialogPreview.preview_rows.map((row, index) => {
+                          const entryId = row.id || `${row.created_at}-${index}-${row.kind}`;
+                          const previewEntry: EntryRecord = {
+                            id: entryId,
+                            pane_id: syncDialog.pane_id,
+                            kind: row.kind,
+                            content: row.content,
+                            synced_from: buildNativePreviewTag(syncDialogPreviewSessionId),
+                            created_at: row.created_at,
+                            preview_truncated: Boolean(row.preview_truncated)
+                          };
+                          return {
+                            id: entryId,
+                            kind: row.kind,
+                            content: row.content,
+                            created_at_text: formatTs(row.created_at),
+                            sid_text: shortSessionId(syncDialogPreviewSessionId),
+                            included: isSyncDialogEntryIncluded(previewEntry),
+                            preview_truncated: Boolean(row.preview_truncated)
+                          };
+                        })
+                      : syncDialogPreviewPanelEntries.map((entry) => {
+                          const sessionId = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+                          return {
+                            id: entry.id,
+                            kind: entry.kind,
+                            content: entry.content,
+                            created_at_text: formatTs(entry.created_at),
+                            sid_text: sessionId ? shortSessionId(sessionId) : "-",
+                            included: isSyncDialogEntryIncluded(entry),
+                            preview_truncated: Boolean(entry.preview_truncated)
+                          };
+                        })
+                  }
                   empty_text={
-                    syncDialogFilteredEntries.length
+                    (syncDialogPreviewSessionId ? syncDialogPreview.preview_rows.length : syncDialogFilteredEntries.length)
                       ? "当前预览会话在筛选条件下暂无记录"
                       : "当前筛选下暂无可同步记录"
+                  }
+                  on_reach_bottom={
+                    syncDialogPreviewSessionId && syncDialogPreview.preview_has_more
+                      ? () => {
+                          if (!syncDialogPreview.preview_from_end) {
+                            void loadMoreSyncDialogPreviewRows();
+                          }
+                        }
+                      : undefined
+                  }
+                  on_reach_top={
+                    syncDialogPreviewSessionId && syncDialogPreview.preview_has_more
+                      ? () => {
+                          if (syncDialogPreview.preview_from_end) {
+                            void loadMoreSyncDialogPreviewRows();
+                          }
+                        }
+                      : undefined
                   }
                   on_toggle_included={(entryId, included) =>
                     toggleSyncDialogEntryExcluded(entryId, !included)

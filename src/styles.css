@@ -587,12 +587,26 @@ body,
   margin: 6px 0 0 !important;
 }
 
+.session-candidate-selection-tag {
+  font-weight: 600;
+  border-radius: 999px;
+  padding-inline: 10px;
+}
+
 .sync-dialog-toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
   margin-bottom: 10px;
+}
+
+.sync-selection-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
 }
 
 .sync-dialog-summary {
@@ -738,11 +752,28 @@ body,
 
 .sync-preview-header {
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.sync-preview-header-main,
+.sync-preview-header-tools {
+  display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
-  margin-bottom: 10px;
+}
+
+.sync-preview-progress-actions,
+.sync-preview-filter-actions,
+.sync-preview-batch-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .sync-preview-loading {
@@ -815,6 +846,7 @@ body,
   border: none !important;
   background: transparent !important;
   box-shadow: none !important;
+  cursor: pointer;
   transition: opacity 180ms ease;
 }
 

@@ -207,6 +207,7 @@ struct NativeSessionMessageDetailResponse {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct NativeSessionMessageSelection {
     message_id: String,
     session_id: String,
@@ -230,6 +231,7 @@ struct SessionParserSamplePreviewResponse {
     file_path: String,
     file_format: String,
     sample_value: serde_json::Value,
+    message_sample_value: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -3653,6 +3655,114 @@ fn read_first_json_value_from_file(path: &Path, file_format: &str) -> Result<ser
     ))
 }
 
+fn extract_first_message_sample_from_root(
+    parser: &SessionParserConfig,
+    root_value: &serde_json::Value,
+    file_session_id: Option<&str>,
+    fallback_timestamp: i64,
+    line_no: i64,
+) -> Option<serde_json::Value> {
+    let message_roots = if parser.message_source_path.trim().is_empty() {
+        vec![root_value.clone()]
+    } else {
+        extract_json_path_values(root_value, &parser.message_source_path)
+    };
+
+    for message_value in message_roots {
+        for rule in &parser.message_rules {
+            let rows = parse_message_rows_with_rule(
+                parser,
+                rule,
+                &message_value,
+                root_value,
+                file_session_id,
+                None,
+                fallback_timestamp,
+                line_no,
+            );
+            if !rows.is_empty() {
+                return Some(message_value);
+            }
+        }
+    }
+
+    None
+}
+
+fn read_first_message_sample_value_from_file(
+    parser: &SessionParserConfig,
+    path: &Path,
+) -> Result<Option<serde_json::Value>> {
+    let mtime = path
+        .metadata()
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_else(now_epoch);
+
+    if parser.file_format == "json" {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read file {}", path.to_string_lossy()))?;
+        let value = serde_json::from_str::<serde_json::Value>(&raw)
+            .with_context(|| format!("failed to parse json file {}", path.to_string_lossy()))?;
+        let file_session_id = first_string_from_paths(&value, &parser.session_id_paths);
+        let fallback_timestamp = first_epoch_from_paths(&value, &parser.fallback_timestamp_paths)
+            .or_else(|| first_epoch_from_paths(&value, &parser.started_at_paths))
+            .unwrap_or(mtime);
+        return Ok(extract_first_message_sample_from_root(
+            parser,
+            &value,
+            file_session_id.as_deref(),
+            fallback_timestamp,
+            1,
+        ));
+    }
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to open file {}", path.to_string_lossy()))?;
+    let reader = BufReader::new(file);
+    let max_meta_lines = parser.session_meta_scan_max_lines.max(0);
+    let mut file_session_id: Option<String> = None;
+
+    for (line_index, row) in reader.lines().take(4096).enumerate() {
+        let line_no = (line_index + 1) as i64;
+        let line = row.with_context(|| format!("failed to read line {}", path.to_string_lossy()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        if file_session_id.is_none() {
+            let should_scan_meta = max_meta_lines == 0 || (line_index as i64) < max_meta_lines;
+            if should_scan_meta
+                && (parser.session_meta_filters.is_empty()
+                    || all_filters_match(&value, &parser.session_meta_filters))
+            {
+                file_session_id = first_string_from_paths(&value, &parser.session_id_paths);
+            }
+        }
+
+        let fallback_timestamp = first_epoch_from_paths(&value, &parser.fallback_timestamp_paths)
+            .or_else(|| first_epoch_from_paths(&value, &parser.started_at_paths))
+            .unwrap_or(mtime);
+        if let Some(sample) = extract_first_message_sample_from_root(
+            parser,
+            &value,
+            file_session_id.as_deref(),
+            fallback_timestamp,
+            line_no,
+        ) {
+            return Ok(Some(sample));
+        }
+    }
+
+    Ok(None)
+}
+
 fn resolve_session_parser_for_preview(
     state: &AppState,
     parser_profile: &str,
@@ -5926,6 +6036,21 @@ fn sync_entries(
 }
 
 #[tauri::command]
+fn sync_text_payload(
+    state: State<AppState>,
+    target_pane_id: String,
+    payload: String,
+) -> Result<(), String> {
+    let normalized = payload.trim().to_string();
+    if normalized.is_empty() {
+        return Err("payload is empty".to_string());
+    }
+
+    paste_to_pane_internal(&state, &target_pane_id, &normalized, false)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn run_provider_prompt(
     state: State<AppState>,
     pane_id: String,
@@ -6687,11 +6812,14 @@ fn preview_session_parser_sample(
     }
     for file_path in files {
         if let Ok(sample_value) = read_first_json_value_from_file(&file_path, &parser.file_format) {
+            let message_sample_value =
+                read_first_message_sample_value_from_file(&parser, &file_path).ok().flatten();
             return Ok(SessionParserSamplePreviewResponse {
                 parser_profile: parser.id.clone(),
                 file_path: file_path.to_string_lossy().to_string(),
                 file_format: parser.file_format.clone(),
                 sample_value,
+                message_sample_value,
             });
         }
     }
@@ -6778,6 +6906,7 @@ fn preview_native_session_messages(
     session_id: String,
     limit: Option<i64>,
     load_all: Option<bool>,
+    from_end: Option<bool>,
 ) -> Result<NativeSessionPreviewResponse, String> {
     let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
     let scan_config = resolve_pane_scan_config(&state, &pane_id, &provider)?;
@@ -6789,6 +6918,7 @@ fn preview_native_session_messages(
     }
     let message_limit = limit.unwrap_or(200).clamp(1, 5000) as usize;
     let load_all_flag = load_all.unwrap_or(false);
+    let from_end_flag = from_end.unwrap_or(false);
     let (rows, total_rows, has_more) = if load_all_flag {
         let all_rows = collect_native_session_preview_rows_for_provider(
             &state,
@@ -6799,6 +6929,18 @@ fn preview_native_session_messages(
         .map_err(|error| error.to_string())?;
         let total_rows = all_rows.len() as i64;
         (all_rows, total_rows, false)
+    } else if from_end_flag {
+        let all_rows = collect_native_session_preview_rows_for_provider(
+            &state,
+            &native_provider,
+            &normalized,
+            matcher.as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
+        let total_rows = all_rows.len() as i64;
+        let start = all_rows.len().saturating_sub(message_limit);
+        let has_more = start > 0;
+        (all_rows.into_iter().skip(start).collect::<Vec<_>>(), total_rows, has_more)
     } else {
         let collected = collect_native_session_preview_rows_for_provider_limited(
             &state,
@@ -6856,26 +6998,17 @@ fn get_native_session_message_details(
 #[tauri::command]
 fn sync_native_session_messages(
     state: State<AppState>,
-    pane_id: String,
     target_pane_id: String,
-    messages: Vec<NativeSessionMessageSelection>,
+    payload: String,
 ) -> Result<EntryRecord, String> {
-    if messages.is_empty() {
-        return Err("no native session messages selected".to_string());
+    let normalized = payload.trim().to_string();
+    if normalized.is_empty() {
+        return Err("payload is empty".to_string());
     }
 
-    let selected = load_native_session_message_details_inner(&state, &pane_id, &messages)
+    paste_to_pane_internal(&state, &target_pane_id, &normalized, true)
         .map_err(|error| error.to_string())?;
-
-    let payload = selected
-        .iter()
-        .map(|item| item.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    paste_to_pane_internal(&state, &target_pane_id, &payload, true)
-        .map_err(|error| error.to_string())?;
-    let entry = add_entry(&state.db_path, &target_pane_id, "input", &payload, None)
+    let entry = add_entry(&state.db_path, &target_pane_id, "input", &normalized, None)
         .map_err(|error| error.to_string())?;
     log_entry_event(&state, &entry, "sync_native_session_messages", Some("sync-native-preview"));
     Ok(entry)
@@ -7945,6 +8078,7 @@ fn main() {
             resize_pane,
             append_entry,
             sync_entries,
+            sync_text_payload,
             run_provider_prompt,
             run_team_prompt,
             suggest_native_session_id,

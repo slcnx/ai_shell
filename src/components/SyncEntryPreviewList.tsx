@@ -57,6 +57,10 @@ type SyncEntryPreviewListProps = {
   on_toggle_included?: (entryId: string, included: boolean) => void;
   user_avatar_src?: string;
   assistant_avatar_src?: string;
+  auto_follow_bottom?: boolean;
+  on_reach_top?: () => void;
+  on_reach_bottom?: () => void;
+  scroll_command?: { target: "top" | "bottom"; nonce: number } | null;
   on_request_full_content?: (
     item: SyncEntryPreviewItem
   ) => Promise<SyncEntryPreviewFullContentResult>;
@@ -208,9 +212,18 @@ function SyncEntryPreviewList({
   on_toggle_included,
   user_avatar_src,
   assistant_avatar_src,
+  auto_follow_bottom = false,
+  on_reach_top,
+  on_reach_bottom,
+  scroll_command,
   on_request_full_content
 }: SyncEntryPreviewListProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
+  const holderRef = useRef<HTMLDivElement | null>(null);
+  const shouldFollowBottomRef = useRef(true);
+  const userScrollTriggeredRef = useRef(false);
+  const lastReachTopHeightRef = useRef(0);
+  const lastReachBottomHeightRef = useRef(0);
   const detailCacheRef = useRef<Map<string, SyncEntryPreviewFullContentResult>>(new Map());
   const [listHeight, setListHeight] = useState(MIN_LIST_HEIGHT);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
@@ -286,6 +299,97 @@ function SyncEntryPreviewList({
 
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) {
+      return undefined;
+    }
+
+    const holder = shell.querySelector<HTMLDivElement>(".rc-virtual-list-holder");
+    if (!holder) {
+      return undefined;
+    }
+
+    holderRef.current = holder;
+    const threshold = 24;
+    const syncFollowState = (allowPaging: boolean) => {
+      const distanceToBottom = holder.scrollHeight - holder.scrollTop - holder.clientHeight;
+      shouldFollowBottomRef.current = distanceToBottom <= threshold;
+      if (allowPaging && holder.scrollTop <= threshold && on_reach_top) {
+        if (holder.scrollHeight !== lastReachTopHeightRef.current) {
+          lastReachTopHeightRef.current = holder.scrollHeight;
+          on_reach_top();
+        }
+      }
+      if (allowPaging && distanceToBottom <= threshold && on_reach_bottom) {
+        if (holder.scrollHeight !== lastReachBottomHeightRef.current) {
+          lastReachBottomHeightRef.current = holder.scrollHeight;
+          on_reach_bottom();
+        }
+      }
+    };
+
+    syncFollowState(false);
+    const handleScroll = () => {
+      userScrollTriggeredRef.current = true;
+      syncFollowState(true);
+    };
+    holder.addEventListener("scroll", handleScroll, { passive: true });
+
+    return () => {
+      holder.removeEventListener("scroll", handleScroll);
+      if (holderRef.current === holder) {
+        holderRef.current = null;
+      }
+    };
+  }, [listHeight, items.length, on_reach_bottom, on_reach_top]);
+
+  useEffect(() => {
+    if (!auto_follow_bottom) {
+      return;
+    }
+
+    const holder = holderRef.current;
+    if (!holder || !shouldFollowBottomRef.current) {
+      return;
+    }
+
+    const rafId = window.requestAnimationFrame(() => {
+      holder.scrollTop = holder.scrollHeight;
+    });
+
+    return () => window.cancelAnimationFrame(rafId);
+  }, [auto_follow_bottom, rows.length]);
+
+  useEffect(() => {
+    userScrollTriggeredRef.current = false;
+    lastReachTopHeightRef.current = 0;
+    lastReachBottomHeightRef.current = 0;
+  }, [items.length]);
+
+  useEffect(() => {
+    if (!scroll_command) {
+      return;
+    }
+
+    const holder = holderRef.current;
+    if (!holder) {
+      return;
+    }
+
+    const rafId = window.requestAnimationFrame(() => {
+      if (scroll_command.target === "top") {
+        holder.scrollTop = 0;
+        shouldFollowBottomRef.current = false;
+      } else {
+        holder.scrollTop = holder.scrollHeight;
+        shouldFollowBottomRef.current = true;
+      }
+    });
+
+    return () => window.cancelAnimationFrame(rafId);
+  }, [scroll_command]);
 
   const toggleExpanded = (entryId: string) => {
     setExpandedIds((current) => {
@@ -401,6 +505,12 @@ function SyncEntryPreviewList({
                     ]
                       .filter(Boolean)
                       .join(" ")}
+                    onClick={() => {
+                      if (!show_checkbox) {
+                        return;
+                      }
+                      on_toggle_included?.(item.id, !item.included);
+                    }}
                   >
                     <div
                       className={[
@@ -411,6 +521,7 @@ function SyncEntryPreviewList({
                       {show_checkbox ? (
                         <Checkbox
                           checked={item.included}
+                          onClick={(event) => event.stopPropagation()}
                           onChange={(event) =>
                             on_toggle_included?.(item.id, Boolean(event.target.checked))
                           }
@@ -447,7 +558,10 @@ function SyncEntryPreviewList({
                                 type="link"
                                 size="small"
                                 className="sync-preview-expand"
-                                onClick={() => toggleExpanded(item.id)}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  toggleExpanded(item.id);
+                                }}
                               >
                                 {expanded ? "收起预览" : "展开预览"}
                               </Button>
@@ -463,7 +577,10 @@ function SyncEntryPreviewList({
                                     type="link"
                                     size="small"
                                     className="sync-preview-detail-btn"
-                                    onClick={() => void openFullContentModal(item)}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void openFullContentModal(item);
+                                    }}
                                   >
                                     弹窗查看完整内容
                                   </Button>

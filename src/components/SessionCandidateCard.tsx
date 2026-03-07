@@ -12,6 +12,8 @@ type SessionCandidateCardProps = {
   record_count: number;
   source_files: number;
   first_input: string;
+  selection_status_text?: string;
+  selection_status_color?: string;
   on_toggle_selected?: (checked: boolean) => void;
   on_preview: () => void;
   on_set_current?: () => void;
@@ -35,6 +37,8 @@ function SessionCandidateCard({
   record_count,
   source_files,
   first_input,
+  selection_status_text,
+  selection_status_color,
   on_toggle_selected,
   on_preview,
   on_set_current,
@@ -83,6 +87,11 @@ function SessionCandidateCard({
       </div>
 
       <Space size={6} wrap>
+        {selection_status_text ? (
+          <Tag color={selection_status_color} className="session-candidate-selection-tag">
+            {selection_status_text}
+          </Tag>
+        ) : null}
         <Tag>创建 {created_text}</Tag>
         <Tag>更新 {updated_text}</Tag>
         <Tag color="cyan">记录 {record_count}</Tag>
