@@ -101,20 +101,20 @@ body,
   border-top: 1px solid rgba(148, 163, 184, 0.26);
   padding: 6px 8px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   justify-content: space-between;
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  overflow-y: hidden;
+  flex-wrap: wrap;
+  overflow: hidden;
 }
 
 .status-info {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 .status-click-tag {
@@ -135,7 +135,7 @@ body,
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-width: max-content;
 }
 
@@ -204,9 +204,10 @@ body,
 }
 
 .status-cache-progress {
-  flex: 1 1 280px;
-  min-width: 200px;
-  max-width: 420px;
+  flex: 1 1 100%;
+  min-width: 0;
+  max-width: none;
+  order: 3;
   display: flex;
   align-items: center;
   gap: 8px;

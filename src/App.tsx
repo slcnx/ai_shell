@@ -284,6 +284,7 @@ type SessionListDialogState = {
   preview_total_rows: number;
   preview_loaded_rows: number;
   preview_has_more: boolean;
+  preview_from_end: boolean;
   unrecognized_files: NativeSessionUnrecognizedFile[];
 };
 
@@ -1592,6 +1593,7 @@ function createSessionListDialogState(): SessionListDialogState {
     preview_total_rows: 0,
     preview_loaded_rows: 0,
     preview_has_more: false,
+    preview_from_end: true,
     unrecognized_files: []
   };
 }
@@ -1771,6 +1773,7 @@ function App() {
   const syncDialogEntryCacheRef = useRef<Map<string, EntryRecord[]>>(new Map());
   const [sessionListPanels, setSessionListPanels] = useState<Record<string, SessionListDialogState>>({});
   const sessionListPanelsRef = useRef<Record<string, SessionListDialogState>>({});
+  const sessionPreviewFollowBottomRef = useRef<Map<string, boolean>>(new Map());
   const sessionListLoadTicketRef = useRef<Map<string, number>>(new Map());
   const sessionPreviewLoadTicketRef = useRef<Map<string, number>>(new Map());
   const [syncDialog, setSyncDialog] = useState<SyncDialogState>(() => createSyncDialogState());
@@ -4549,6 +4552,9 @@ function App() {
       loadAll = false,
       options?: {
         keepPanelClosed?: boolean;
+        fromEnd?: boolean;
+        offset?: number;
+        mergeMode?: "replace" | "prepend" | "append";
       }
     ) => {
       const sid = sessionId.trim();
@@ -4557,6 +4563,9 @@ function App() {
       }
       const ticket = nextSessionPreviewLoadTicket(paneId);
       const keepPanelClosed = Boolean(options?.keepPanelClosed);
+      const fromEnd = options?.fromEnd ?? !loadAll;
+      const offset = options?.offset ?? 0;
+      const mergeMode = options?.mergeMode ?? "replace";
       updateSessionListPanelState(paneId, (current) => ({
         ...current,
         open: keepPanelClosed ? current.open : true,
@@ -4568,7 +4577,9 @@ function App() {
           paneId,
           sessionId: sid,
           limit: 200,
-          loadAll
+          offset,
+          loadAll,
+          fromEnd
         });
         if (!isSessionPreviewLoadTicketActive(paneId, ticket)) {
           return;
@@ -4581,13 +4592,21 @@ function App() {
           ) {
             return current;
           }
+          const incomingRows = response.rows || [];
+          const nextRows =
+            mergeMode === "prepend" && current.preview_session_id === sid
+              ? [...incomingRows, ...current.preview_rows]
+              : mergeMode === "append" && current.preview_session_id === sid
+                ? [...current.preview_rows, ...incomingRows]
+                : incomingRows;
           return {
             ...current,
             preview_loading: false,
-            preview_rows: response.rows || [],
+            preview_rows: nextRows,
             preview_total_rows: Number(response.total_rows || 0),
-            preview_loaded_rows: Number(response.loaded_rows || 0),
-            preview_has_more: Boolean(response.has_more)
+            preview_loaded_rows: nextRows.length,
+            preview_has_more: Boolean(response.has_more),
+            preview_from_end: fromEnd
           };
         });
       } catch (error) {
@@ -4992,7 +5011,8 @@ function App() {
           paneId,
           sessionId: sid,
           limit: 200,
-          loadAll
+          loadAll,
+          fromEnd: !loadAll
         });
         if (sessionManagePreviewTicketRef.current !== ticket) {
           return;
@@ -5070,6 +5090,8 @@ function App() {
   const openSessionListDialog = useCallback(
     async (paneId: string) => {
       const panel = getSessionListPanelState(paneId);
+      const pane = panes.find((item) => item.id === paneId);
+      const activeSessionId = pane?.active_session_id.trim() ?? "";
       if (panel.open) {
         void nextSessionListLoadTicket(paneId);
         void nextSessionPreviewLoadTicket(paneId);
@@ -5091,6 +5113,13 @@ function App() {
         panel.offset < panel.total;
       if (shouldReload) {
         await reloadSessionListDialog(paneId);
+        if (activeSessionId) {
+          await loadSessionListPreview(paneId, activeSessionId, false, { fromEnd: true });
+        }
+        return;
+      }
+      if (activeSessionId) {
+        await loadSessionListPreview(paneId, activeSessionId, false, { fromEnd: true });
         return;
       }
       if (panel.preview_session_id.trim()) {
@@ -5107,6 +5136,7 @@ function App() {
       loadSessionListPreview,
       nextSessionListLoadTicket,
       nextSessionPreviewLoadTicket,
+      panes,
       reloadSessionListDialog,
       updateSessionListPanelState
     ]
@@ -5424,7 +5454,8 @@ function App() {
           item.panel.open &&
           item.active_session_id &&
           !item.panel.preview_loading &&
-          item.panel.preview_session_id.trim() === item.active_session_id
+          item.panel.preview_session_id.trim() === item.active_session_id &&
+          (sessionPreviewFollowBottomRef.current.get(item.pane_id) ?? true)
       );
 
     if (!activePreviewTargets.length) {
@@ -5986,6 +6017,19 @@ function App() {
                               user_avatar_src={userAvatarSrc}
                               assistant_avatar_src={assistantAvatarSrc}
                               auto_follow_bottom
+                              on_follow_bottom_change={(following) =>
+                                sessionPreviewFollowBottomRef.current.set(pane.id, following)
+                              }
+                              on_reach_top={
+                                inlinePreviewSessionId && sessionListDialog.preview_has_more
+                                  ? () =>
+                                      void loadSessionListPreview(pane.id, inlinePreviewSessionId, false, {
+                                        fromEnd: true,
+                                        offset: sessionListDialog.preview_loaded_rows,
+                                        mergeMode: "prepend"
+                                      })
+                                  : undefined
+                              }
                               items={inlinePreviewRows.map((row, index) => ({
                                 id: row.id || `${row.created_at}-${index}-${row.kind}`,
                                 kind: row.kind,
@@ -7860,6 +7904,20 @@ function App() {
                   }
                   on_toggle_included={(entryId, included) =>
                     toggleSyncDialogEntryExcluded(entryId, !included)
+                  }
+                  on_request_full_content={(item) =>
+                    loadNativePreviewMessageDetail(
+                      syncDialog.pane_id,
+                      syncDialogPreviewSessionId || resolveEntrySessionId(syncDialog.entries.find((entry) => entry.id === item.id) || {
+                        id: item.id,
+                        pane_id: syncDialog.pane_id,
+                        kind: item.kind,
+                        content: item.content,
+                        synced_from: buildNativePreviewTag(syncDialogPreviewSessionId),
+                        created_at: 0
+                      }, syncDialogCurrentSessionId),
+                      item
+                    )
                   }
                 />
               </>

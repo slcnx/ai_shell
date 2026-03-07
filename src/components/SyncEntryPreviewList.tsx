@@ -58,6 +58,7 @@ type SyncEntryPreviewListProps = {
   user_avatar_src?: string;
   assistant_avatar_src?: string;
   auto_follow_bottom?: boolean;
+  on_follow_bottom_change?: (following: boolean) => void;
   on_reach_top?: () => void;
   on_reach_bottom?: () => void;
   scroll_command?: { target: "top" | "bottom"; nonce: number } | null;
@@ -213,6 +214,7 @@ function SyncEntryPreviewList({
   user_avatar_src,
   assistant_avatar_src,
   auto_follow_bottom = false,
+  on_follow_bottom_change,
   on_reach_top,
   on_reach_bottom,
   scroll_command,
@@ -315,7 +317,13 @@ function SyncEntryPreviewList({
     const threshold = 24;
     const syncFollowState = (allowPaging: boolean) => {
       const distanceToBottom = holder.scrollHeight - holder.scrollTop - holder.clientHeight;
-      shouldFollowBottomRef.current = distanceToBottom <= threshold;
+      const following = distanceToBottom <= threshold;
+      if (shouldFollowBottomRef.current !== following) {
+        shouldFollowBottomRef.current = following;
+        on_follow_bottom_change?.(following);
+      } else {
+        shouldFollowBottomRef.current = following;
+      }
       if (allowPaging && holder.scrollTop <= threshold && on_reach_top) {
         if (holder.scrollHeight !== lastReachTopHeightRef.current) {
           lastReachTopHeightRef.current = holder.scrollHeight;
@@ -343,7 +351,7 @@ function SyncEntryPreviewList({
         holderRef.current = null;
       }
     };
-  }, [listHeight, items.length, on_reach_bottom, on_reach_top]);
+  }, [listHeight, items.length, on_follow_bottom_change, on_reach_bottom, on_reach_top]);
 
   useEffect(() => {
     if (!auto_follow_bottom) {
@@ -382,14 +390,16 @@ function SyncEntryPreviewList({
       if (scroll_command.target === "top") {
         holder.scrollTop = 0;
         shouldFollowBottomRef.current = false;
+        on_follow_bottom_change?.(false);
       } else {
         holder.scrollTop = holder.scrollHeight;
         shouldFollowBottomRef.current = true;
+        on_follow_bottom_change?.(true);
       }
     });
 
     return () => window.cancelAnimationFrame(rafId);
-  }, [scroll_command]);
+  }, [on_follow_bottom_change, scroll_command]);
 
   const toggleExpanded = (entryId: string) => {
     setExpandedIds((current) => {
