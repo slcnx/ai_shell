@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.7
+
+- 修复 release workflow 中 macOS 安装依赖阶段的 npm registry 兼容问题
+- 在 CI 中统一将 lockfile 里的镜像源规范化为 npm 官方源，提升 esbuild 安装稳定性
+
 ## v0.1.6
 
 - 优化同步中心会话/消息选择语义，区分整会话选择与手工消息选择
@@ -13,4 +18,3 @@
 ## v0.1.5
 
 - 发布同步中心与预览体验优化版本
-

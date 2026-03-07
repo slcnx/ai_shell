@@ -45,6 +45,11 @@ jobs:
             libsoup-3.0-dev \
             patchelf
 
+      - name: Normalize npm registry URLs
+        shell: bash
+        run: |
+          node -e "const fs=require('fs'); const path='package-lock.json'; const from='https://mirrors.cloud.tencent.com/npm/'; const to='https://registry.npmjs.org/'; const raw=fs.readFileSync(path,'utf8'); const next=raw.split(from).join(to); if (raw!==next) fs.writeFileSync(path,next);"
+
       - name: Install frontend dependencies
         run: npm ci
 
