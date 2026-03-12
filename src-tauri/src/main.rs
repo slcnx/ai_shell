@@ -1,5 +1,7 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
+mod ai_team_mcp;
+
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
@@ -30,6 +32,7 @@ struct PaneRuntime {
 struct AppState {
     panes: Mutex<HashMap<String, PaneRuntime>>,
     pane_runtime_starts: Mutex<HashMap<String, i64>>,
+    pane_output_buffers: Arc<Mutex<HashMap<String, PaneOutputBuffer>>>,
     native_session_candidates_cache: Mutex<HashMap<String, NativeSessionCandidatesCache>>,
     native_session_preview_cache: Mutex<HashMap<String, NativeSessionPreviewCache>>,
     native_session_record_count_cache: Mutex<HashMap<String, NativeSessionRecordCountCache>>,
@@ -45,9 +48,23 @@ struct AppState {
     log_lock: Mutex<()>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PaneOutputBuffer {
+    revision: u64,
+    text: String,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SidProbeProfile {
+    probe_command: &'static str,
+    timeout_secs: i64,
+    cleanup_input: Option<&'static str>,
+    labels: &'static [&'static str],
+}
+
 #[derive(Debug, Clone)]
 struct NativeSessionCandidatesCache {
-    updated_at: i64,
     batch: NativeSessionCandidatesBatch,
 }
 
@@ -1734,6 +1751,190 @@ fn sanitize_log_text(content: &str) -> String {
     value = value.replace('\u{0008}', "");
     value = value.replace('\u{0000}', "");
     value
+}
+
+const PANE_OUTPUT_BUFFER_MAX_BYTES: usize = 256 * 1024;
+const STATUS_SESSION_DETECT_TIMEOUT_SECS: i64 = 6;
+const STATUS_SESSION_DETECT_POLL_MS: u64 = 150;
+
+fn sid_probe_profile(provider: &str) -> Option<SidProbeProfile> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some(SidProbeProfile {
+            probe_command: "/status",
+            timeout_secs: STATUS_SESSION_DETECT_TIMEOUT_SECS,
+            cleanup_input: None,
+            labels: &["session:"],
+        }),
+        "claude" => Some(SidProbeProfile {
+            probe_command: "/status",
+            timeout_secs: STATUS_SESSION_DETECT_TIMEOUT_SECS,
+            cleanup_input: Some("\u{1b}"),
+            labels: &["session id:"],
+        }),
+        "gemini" => Some(SidProbeProfile {
+            probe_command: "/stats session",
+            timeout_secs: STATUS_SESSION_DETECT_TIMEOUT_SECS,
+            cleanup_input: None,
+            labels: &["session id:"],
+        }),
+        _ => None,
+    }
+}
+
+fn trim_output_buffer_to_limit(text: &mut String) {
+    if text.len() <= PANE_OUTPUT_BUFFER_MAX_BYTES {
+        return;
+    }
+    let mut start = text.len().saturating_sub(PANE_OUTPUT_BUFFER_MAX_BYTES);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    if start > 0 && start < text.len() {
+        text.drain(..start);
+    }
+}
+
+fn clear_pane_output_buffer(
+    buffers: &Arc<Mutex<HashMap<String, PaneOutputBuffer>>>,
+    pane_id: &str,
+) {
+    if let Ok(mut map) = buffers.lock() {
+        map.insert(
+            pane_id.to_string(),
+            PaneOutputBuffer {
+                revision: 0,
+                text: String::new(),
+                updated_at: now_epoch(),
+            },
+        );
+    }
+}
+
+fn remove_pane_output_buffer(
+    buffers: &Arc<Mutex<HashMap<String, PaneOutputBuffer>>>,
+    pane_id: &str,
+) {
+    if let Ok(mut map) = buffers.lock() {
+        map.remove(pane_id);
+    }
+}
+
+fn append_pane_output_buffer(
+    buffers: &Arc<Mutex<HashMap<String, PaneOutputBuffer>>>,
+    pane_id: &str,
+    raw: &str,
+) {
+    let sanitized = sanitize_log_text(raw);
+    if sanitized.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = buffers.lock() {
+        let entry = map.entry(pane_id.to_string()).or_default();
+        entry.revision = entry.revision.saturating_add(1);
+        entry.updated_at = now_epoch();
+        entry.text.push_str(&sanitized);
+        trim_output_buffer_to_limit(&mut entry.text);
+    }
+}
+
+fn snapshot_pane_output_buffer(
+    buffers: &Arc<Mutex<HashMap<String, PaneOutputBuffer>>>,
+    pane_id: &str,
+) -> (u64, String) {
+    if let Ok(map) = buffers.lock() {
+        if let Some(item) = map.get(pane_id) {
+            return (item.revision, item.text.clone());
+        }
+    }
+    (0, String::new())
+}
+
+fn extract_uuid_token(text: &str) -> Option<String> {
+    let mut token = String::new();
+    let mut found = None;
+    for ch in text.chars() {
+        if ch.is_ascii_hexdigit() || ch == '-' {
+            token.push(ch);
+            continue;
+        }
+        if let Ok(parsed) = Uuid::parse_str(token.trim()) {
+            found = Some(parsed.to_string());
+        }
+        token.clear();
+    }
+    if let Ok(parsed) = Uuid::parse_str(token.trim()) {
+        found = Some(parsed.to_string());
+    }
+    found
+}
+
+fn extract_session_id_from_labeled_text(text: &str, labels: &[&str]) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for needle in labels {
+        if let Some(position) = lower.rfind(needle) {
+            let start = position + needle.len();
+            let tail = text[start..].chars().take(160).collect::<String>();
+            if let Some(session_id) = extract_uuid_token(&tail) {
+                return Some(session_id);
+            }
+        }
+    }
+    None
+}
+
+fn extract_session_id_from_status_output(text: &str, labels: &[&str]) -> Option<String> {
+    let normalized = sanitize_log_text(text);
+    for line in normalized.lines().rev() {
+        if let Some(session_id) = extract_session_id_from_labeled_text(line, labels) {
+            return Some(session_id);
+        }
+    }
+    extract_session_id_from_labeled_text(&normalized, labels)
+}
+
+fn detect_pane_session_id_via_status_inner(
+    state: &AppState,
+    pane_id: &str,
+    provider: &str,
+    timeout_secs_override: Option<i64>,
+) -> Result<Option<String>, String> {
+    let Some(profile) = sid_probe_profile(provider) else {
+        return Ok(None);
+    };
+    let timeout = timeout_secs_override
+        .unwrap_or(profile.timeout_secs)
+        .clamp(1, 30);
+    let (initial_revision, initial_text) = snapshot_pane_output_buffer(&state.pane_output_buffers, pane_id);
+    let initial_len = initial_text.len();
+    write_to_pane_internal(state, pane_id, &format!("{}\r", profile.probe_command), false)
+        .map_err(|error| error.to_string())?;
+
+    let started = std::time::Instant::now();
+    let timeout_duration = std::time::Duration::from_secs(timeout as u64);
+    let poll_duration = std::time::Duration::from_millis(STATUS_SESSION_DETECT_POLL_MS);
+    loop {
+        let (revision, text) = snapshot_pane_output_buffer(&state.pane_output_buffers, pane_id);
+        if revision > initial_revision {
+            let candidate_slice = if text.len() >= initial_len && text.is_char_boundary(initial_len) {
+                &text[initial_len..]
+            } else {
+                text.as_str()
+            };
+            if let Some(session_id) = extract_session_id_from_status_output(candidate_slice, profile.labels) {
+                if let Some(cleanup_input) = profile.cleanup_input {
+                    let _ = write_to_pane_internal(state, pane_id, cleanup_input, false);
+                }
+                return Ok(Some(session_id));
+            }
+        }
+        if started.elapsed() >= timeout_duration {
+            if let Some(cleanup_input) = profile.cleanup_input {
+                let _ = write_to_pane_internal(state, pane_id, cleanup_input, false);
+            }
+            return Ok(None);
+        }
+        std::thread::sleep(poll_duration);
+    }
 }
 
 fn should_drop_codex_instruction_line(line: &str) -> bool {
@@ -4525,34 +4726,6 @@ fn sort_session_candidates(items: &mut Vec<NativeSessionCandidate>) {
     });
 }
 
-fn list_native_session_candidates_for_provider(
-    state: &AppState,
-    provider: &str,
-    matcher: Option<&SessionFileMatcher>,
-) -> Result<NativeSessionCandidatesBatch> {
-    let parser = resolve_session_parser_profile(&state.session_parser_config_dir, provider)
-        .ok_or_else(|| anyhow!("session parser profile not found: {}", provider))?;
-    let mut map = HashMap::<String, NativeSessionCandidate>::new();
-    let indexed = collect_parser_metas_indexed(state, &parser, matcher)?;
-    for meta in indexed.metas {
-        merge_session_candidate(
-            &mut map,
-            &parser.id,
-            &meta.session_id,
-            meta.started_at,
-            meta.mtime,
-            meta.record_count,
-            &meta.first_input,
-        );
-    }
-    let mut items = map.into_values().collect::<Vec<_>>();
-    sort_session_candidates(&mut items);
-    Ok(NativeSessionCandidatesBatch {
-        items,
-        unrecognized_files: indexed.unrecognized_files,
-    })
-}
-
 fn collect_native_session_metas_from_index(
     connection: &Connection,
     provider: &str,
@@ -4596,20 +4769,7 @@ fn collect_native_session_preview_rows_for_provider(
     session_id: &str,
     matcher: Option<&SessionFileMatcher>,
 ) -> Result<Vec<NativeSessionPreviewRow>> {
-    collect_native_session_preview_rows_for_provider_limited(
-        state,
-        provider,
-        session_id,
-        matcher,
-        None,
-    )
-    .map(|result| result.rows)
-}
-
-#[derive(Debug, Clone, Default)]
-struct NativeSessionPreviewCollectResult {
-    rows: Vec<NativeSessionPreviewRow>,
-    has_more: bool,
+    collect_native_session_preview_rows_for_provider_limited(state, provider, session_id, matcher, None)
 }
 
 fn collect_native_session_preview_rows_for_provider_limited(
@@ -4618,29 +4778,32 @@ fn collect_native_session_preview_rows_for_provider_limited(
     session_id: &str,
     matcher: Option<&SessionFileMatcher>,
     max_rows: Option<usize>,
-) -> Result<NativeSessionPreviewCollectResult> {
+) -> Result<Vec<NativeSessionPreviewRow>> {
     let parser = resolve_session_parser_profile(&state.session_parser_config_dir, provider)
         .ok_or_else(|| anyhow!("session parser profile not found: {}", provider))?;
     let connection = open_db(&state.db_path)?;
     let mut metas =
         collect_native_session_metas_from_index(&connection, &parser.id, Some(session_id), matcher)?;
+    if metas.is_empty() {
+        let refreshed = collect_parser_metas_indexed(state, &parser, matcher)?;
+        metas = refreshed
+            .metas
+            .into_iter()
+            .filter(|meta| meta.session_id.trim() == session_id)
+            .collect::<Vec<_>>();
+    }
     metas.sort_by_key(|meta| (meta.file_time_key, meta.started_at, meta.mtime));
 
     let mut rows = Vec::<NativeSessionPreviewRow>::new();
     let mut seen = HashSet::<String>::new();
-    let mut has_more = false;
     for meta in metas {
         if let Some(limit) = max_rows {
             if rows.len() >= limit {
-                has_more = true;
                 break;
             }
         }
         let per_file_limit = max_rows.map(|limit| limit.saturating_sub(rows.len()));
         let parsed = parse_session_file(&parser, &meta.file_path, Some(session_id), per_file_limit);
-        if parsed.truncated {
-            has_more = true;
-        }
         for row in parsed.rows {
             let row_sid = row.session_id.trim();
             if !row_sid.is_empty() && row_sid != session_id {
@@ -4649,23 +4812,18 @@ fn collect_native_session_preview_rows_for_provider_limited(
             push_preview_row(&mut rows, &mut seen, &meta.file_path, &row)?;
             if let Some(limit) = max_rows {
                 if rows.len() > limit {
-                    has_more = true;
                     break;
                 }
             }
-        }
-        if has_more {
-            break;
         }
     }
     sort_preview_rows(&mut rows);
     if let Some(limit) = max_rows {
         if rows.len() > limit {
             rows.truncate(limit);
-            has_more = true;
         }
     }
-    Ok(NativeSessionPreviewCollectResult { rows, has_more })
+    Ok(rows)
 }
 
 fn count_native_session_records_for_provider(
@@ -4697,41 +4855,6 @@ fn count_native_session_records_for_provider(
     total
 }
 
-fn load_native_session_candidates_cached(
-    state: &AppState,
-    provider: &str,
-    cache_key: &str,
-    ttl_secs: i64,
-    matcher: Option<&SessionFileMatcher>,
-) -> Result<NativeSessionCandidatesBatch, String> {
-    if ttl_secs <= 0 {
-        return list_native_session_candidates_for_provider(state, provider, matcher)
-            .map_err(|error| error.to_string());
-    }
-
-    let now = now_epoch();
-    if let Ok(cache) = state.native_session_candidates_cache.lock() {
-        if let Some(hit) = cache.get(cache_key) {
-            if now.saturating_sub(hit.updated_at) <= ttl_secs {
-                return Ok(hit.batch.clone());
-            }
-        }
-    }
-
-    let batch = list_native_session_candidates_for_provider(state, provider, matcher)
-        .map_err(|error| error.to_string())?;
-    if let Ok(mut cache) = state.native_session_candidates_cache.lock() {
-        cache.insert(
-            cache_key.to_string(),
-            NativeSessionCandidatesCache {
-                updated_at: now,
-                batch: batch.clone(),
-            },
-        );
-    }
-    Ok(batch)
-}
-
 fn load_native_session_candidates_cache_first(
     state: &AppState,
     provider: &str,
@@ -4757,7 +4880,6 @@ fn load_native_session_candidates_cache_first(
         cache.insert(
             cache_key.to_string(),
             NativeSessionCandidatesCache {
-                updated_at: now_epoch(),
                 batch: batch.clone(),
             },
         );
@@ -5382,8 +5504,10 @@ fn start_runtime(app: &AppHandle, state: &AppState, pane_id: String, _provider: 
         child: Arc::new(Mutex::new(child)),
     };
 
+    clear_pane_output_buffer(&state.pane_output_buffers, &pane_id);
     let pane_id_for_thread = pane_id.clone();
     let app_for_thread = app.clone();
+    let output_buffers = state.pane_output_buffers.clone();
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 4096];
         loop {
@@ -5391,6 +5515,7 @@ fn start_runtime(app: &AppHandle, state: &AppState, pane_id: String, _provider: 
                 Ok(0) => break,
                 Ok(size) => {
                     let data = String::from_utf8_lossy(&buffer[..size]).to_string();
+                    append_pane_output_buffer(&output_buffers, &pane_id_for_thread, &data);
                     let _ = app_for_thread.emit(
                         "terminal-output",
                         TerminalOutputEvent {
@@ -5455,6 +5580,19 @@ fn normalize_working_directory(path: Option<String>) -> Result<Option<PathBuf>> 
         ));
     }
     Ok(Some(resolved))
+}
+
+fn normalize_directory_path(path: String) -> Result<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("path is empty"));
+    }
+    let mut resolved = PathBuf::from(trimmed);
+    if resolved.is_relative() {
+        let current = std::env::current_dir().context("failed to resolve current dir")?;
+        resolved = current.join(resolved);
+    }
+    Ok(resolved)
 }
 
 fn normalize_workdir_binding_key(path: String) -> Result<String> {
@@ -5620,7 +5758,7 @@ fn paste_to_pane_internal(
     payload.push_str(&normalized);
     payload.push_str("\u{1b}[201~");
     if submit {
-        payload.push('\n');
+        payload.push('\r');
     }
 
     let mut writer = runtime
@@ -5640,6 +5778,7 @@ fn stop_pane_runtime(state: &AppState, pane_id: &str) -> Result<()> {
             .map_err(|_| anyhow!("failed to lock pane runtime start map"))?;
         starts.remove(pane_id);
     }
+    remove_pane_output_buffer(&state.pane_output_buffers, pane_id);
 
     let runtime = {
         let mut runtimes = state
@@ -5666,6 +5805,9 @@ fn stop_all_pane_runtimes(state: &AppState) -> Result<()> {
             .lock()
             .map_err(|_| anyhow!("failed to lock pane runtime start map"))?;
         starts.clear();
+    }
+    if let Ok(mut buffers) = state.pane_output_buffers.lock() {
+        buffers.clear();
     }
 
     let runtimes = {
@@ -6196,11 +6338,22 @@ fn suggest_native_session_id_inner(
     if metas.is_empty() {
         return Ok(None);
     }
+    let now = now_epoch();
+    let recent_window_secs = 10_i64;
+    let recent_metas = metas
+        .iter()
+        .filter(|meta| {
+            meta.started_at > 0 && now.saturating_sub(meta.started_at).abs() <= recent_window_secs
+        })
+        .collect::<Vec<_>>();
+    if recent_metas.is_empty() {
+        return Ok(None);
+    }
     if let Some(minimum) = runtime_start {
-        let active = metas
+        let active = recent_metas
             .iter()
-            .filter(|meta| meta.started_at > 0 && meta.started_at >= minimum.saturating_sub(30))
-            .max_by_key(|meta| (meta.file_time_key, meta.started_at, meta.mtime))
+            .filter(|meta| meta.started_at >= minimum.saturating_sub(recent_window_secs))
+            .max_by_key(|meta| (meta.started_at, meta.mtime))
             .map(|meta| meta.session_id.clone());
         if active.is_some() {
             return Ok(active);
@@ -6212,17 +6365,17 @@ fn suggest_native_session_id_inner(
     let pane_created_at = load_pane_created_at(&connection, pane_id)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
-    let near_now = metas
+    let near_now = recent_metas
         .iter()
-        .filter(|meta| meta.started_at > 0 && meta.started_at >= pane_created_at.saturating_sub(180))
-        .max_by_key(|meta| (meta.file_time_key, meta.started_at, meta.mtime))
+        .filter(|meta| meta.started_at >= pane_created_at.saturating_sub(recent_window_secs))
+        .max_by_key(|meta| (meta.started_at, meta.mtime))
         .map(|meta| meta.session_id.clone());
     if near_now.is_some() {
         return Ok(near_now);
     }
-    Ok(metas
+    Ok(recent_metas
         .iter()
-        .max_by_key(|meta| (meta.file_time_key, meta.started_at, meta.mtime))
+        .max_by_key(|meta| (meta.started_at, meta.mtime))
         .map(|meta| meta.session_id.clone()))
 }
 
@@ -6430,21 +6583,7 @@ fn import_native_history_inner(
 #[tauri::command]
 fn suggest_native_session_id(state: State<AppState>, pane_id: String) -> Result<Option<String>, String> {
     let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
-    let scan_config = resolve_pane_scan_config(&state, &pane_id, &provider)?;
-    let matcher = SessionFileMatcher::from_raw(&scan_config.file_glob);
-    let runtime_start = state
-        .pane_runtime_starts
-        .lock()
-        .map_err(|_| "failed to lock pane runtime start map".to_string())?
-        .get(&pane_id)
-        .copied();
-    suggest_native_session_id_inner(
-        &state,
-        &pane_id,
-        &scan_config.parser_profile,
-        runtime_start,
-        matcher.as_ref(),
-    )
+    detect_pane_session_id_via_status_inner(&state, &pane_id, &provider, None)
 }
 
 #[tauri::command]
@@ -6497,7 +6636,6 @@ fn list_native_session_candidates(
             cache.insert(
                 cache_key.clone(),
                 NativeSessionCandidatesCache {
-                    updated_at: now_epoch(),
                     batch: batch.clone(),
                 },
             );
@@ -6884,7 +7022,6 @@ fn reindex_native_sessions(
             cache.insert(
                 cache_key,
                 NativeSessionCandidatesCache {
-                    updated_at: now_epoch(),
                     batch,
                 },
             );
@@ -6921,7 +7058,6 @@ fn refresh_native_session_cache(
         cache.insert(
             cache_key,
             NativeSessionCandidatesCache {
-                updated_at: now_epoch(),
                 batch,
             },
         );
@@ -6965,7 +7101,7 @@ fn preview_native_session_messages(
         .map_err(|error| error.to_string())?
     } else if let Ok(cache) = state.native_session_preview_cache.lock() {
         if let Some(hit) = cache.get(&cache_key) {
-            if cache_ttl_secs > 0 && now.saturating_sub(hit.updated_at) <= cache_ttl_secs {
+            if cache_ttl_secs > 0 && now.saturating_sub(hit.updated_at) <= cache_ttl_secs && !hit.rows.is_empty() {
                 hit.rows.clone()
             } else {
                 collect_native_session_preview_rows_for_provider(
@@ -7464,13 +7600,7 @@ fn suggest_codex_session_id(state: State<AppState>, pane_id: String) -> Result<O
     if provider != "codex" {
         return Ok(None);
     }
-    let runtime_start = state
-        .pane_runtime_starts
-        .lock()
-        .map_err(|_| "failed to lock pane runtime start map".to_string())?
-        .get(&pane_id)
-        .copied();
-    suggest_native_session_id_inner(&state, &pane_id, "codex", runtime_start, None)
+    detect_pane_session_id_via_status_inner(&state, &pane_id, &provider, None)
 }
 
 #[tauri::command]
@@ -7688,6 +7818,22 @@ fn set_working_directory(
     }
 
     Ok(normalized.map(|item| item.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn ensure_directory(path: String) -> Result<String, String> {
+    let resolved = normalize_directory_path(path).map_err(|error| error.to_string())?;
+    if resolved.exists() {
+        if !resolved.is_dir() {
+            return Err(format!(
+                "path is not a directory: {}",
+                resolved.to_string_lossy()
+            ));
+        }
+    } else {
+        fs::create_dir_all(&resolved).map_err(|error| error.to_string())?;
+    }
+    Ok(resolved.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -8062,6 +8208,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let data_dir = app
                 .path()
@@ -8109,6 +8256,7 @@ fn main() {
             app.manage(AppState {
                 panes: Mutex::new(HashMap::new()),
                 pane_runtime_starts: Mutex::new(HashMap::new()),
+                pane_output_buffers: Arc::new(Mutex::new(HashMap::new())),
                 native_session_candidates_cache: Mutex::new(HashMap::new()),
                 native_session_preview_cache: Mutex::new(HashMap::new()),
                 native_session_record_count_cache: Mutex::new(HashMap::new()),
@@ -8173,10 +8321,27 @@ fn main() {
             set_avatar_config,
             load_avatar_data_url,
             set_working_directory,
+            ensure_directory,
             set_native_session_list_cache_ttl_secs,
             list_workdir_session_bindings,
             upsert_workdir_session_binding,
             delete_workdir_session_binding,
+            ai_team_mcp::ai_team_create_team,
+            ai_team_mcp::ai_team_get_snapshot,
+            ai_team_mcp::ai_team_initialize_team,
+            ai_team_mcp::ai_team_read_role_sid,
+            ai_team_mcp::ai_team_set_role_sid,
+            ai_team_mcp::ai_team_clear_role_sid,
+            ai_team_mcp::ai_team_refresh_role_sid,
+            ai_team_mcp::ai_team_send_role_hello,
+            ai_team_mcp::ai_team_send_all_role_hello,
+            ai_team_mcp::ai_team_bind_role_sid,
+            ai_team_mcp::ai_team_bind_all_role_sids,
+            ai_team_mcp::ai_team_send_message,
+            ai_team_mcp::ai_team_load_conversation,
+            ai_team_mcp::ai_team_is_conversation_finished,
+            ai_team_mcp::ai_team_submit_requirement,
+            ai_team_mcp::ai_team_execute_next,
             clear_all_history,
             clear_pane_history
         ])

@@ -4,6 +4,7 @@
   UserOutlined
 } from "@ant-design/icons";
 import {
+  type ComponentPropsWithoutRef,
   type CSSProperties,
   type ReactNode,
   useEffect,
@@ -23,15 +24,51 @@ import {
   Tag,
   Typography
 } from "antd";
-import ReactMarkdown from "react-markdown";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import VirtualList from "rc-virtual-list";
 
-const MIN_LIST_HEIGHT = 220;
+const DEFAULT_LIST_HEIGHT = 220;
+const MIN_LIST_HEIGHT = 1;
 const MIN_ITEM_HEIGHT = 132;
 const COLLAPSE_LINE_LIMIT = 5;
 const COLLAPSE_CHAR_LIMIT = 320;
 const COLLAPSE_MAX_HEIGHT = 164;
+
+type MarkdownLinkProps = ComponentPropsWithoutRef<"a"> & {
+  children?: ReactNode;
+  href?: string;
+  node?: unknown;
+};
+
+const syncPreviewMarkdownComponents = {
+  a: ({ children, href, node: _node, onClick, rel, target, ...props }: MarkdownLinkProps) => {
+    const normalizedHref = typeof href === "string" ? href.trim() : "";
+    const shouldOpenExternally = /^(https?:|mailto:|tel:)/i.test(normalizedHref);
+
+    return (
+      <a
+        {...props}
+        href={normalizedHref || href}
+        rel={shouldOpenExternally ? "noreferrer" : rel}
+        target={shouldOpenExternally ? "_blank" : target}
+        onClick={(event) => {
+          onClick?.(event);
+          if (event.defaultPrevented || !shouldOpenExternally || !normalizedHref) {
+            return;
+          }
+          event.preventDefault();
+          void openUrl(normalizedHref).catch((error) => {
+            console.error("Failed to open preview link in external browser", error);
+          });
+        }}
+      >
+        {children}
+      </a>
+    );
+  }
+} satisfies Components;
 
 export type SyncEntryPreviewItem = {
   id: string;
@@ -200,7 +237,9 @@ function SyncPreviewMarkdown({
       style={style}
     >
       <div ref={contentRef} className="sync-preview-markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+        <ReactMarkdown components={syncPreviewMarkdownComponents} remarkPlugins={[remarkGfm]}>
+          {content}
+        </ReactMarkdown>
       </div>
     </div>
   );
@@ -227,7 +266,7 @@ function SyncEntryPreviewList({
   const lastReachTopHeightRef = useRef(0);
   const lastReachBottomHeightRef = useRef(0);
   const detailCacheRef = useRef<Map<string, SyncEntryPreviewFullContentResult>>(new Map());
-  const [listHeight, setListHeight] = useState(MIN_LIST_HEIGHT);
+  const [listHeight, setListHeight] = useState(DEFAULT_LIST_HEIGHT);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
   const [detailModal, setDetailModal] = useState<FullContentModalState>({
     open: false,
@@ -315,6 +354,8 @@ function SyncEntryPreviewList({
 
     holderRef.current = holder;
     const threshold = 24;
+    let followBottomRafId: number | null = null;
+    let settleBottomRafId: number | null = null;
     const syncFollowState = (allowPaging: boolean) => {
       const distanceToBottom = holder.scrollHeight - holder.scrollTop - holder.clientHeight;
       const following = distanceToBottom <= threshold;
@@ -337,21 +378,59 @@ function SyncEntryPreviewList({
         }
       }
     };
-
-    syncFollowState(false);
+    const cancelScheduledFollowBottom = () => {
+      if (followBottomRafId !== null) {
+        window.cancelAnimationFrame(followBottomRafId);
+        followBottomRafId = null;
+      }
+      if (settleBottomRafId !== null) {
+        window.cancelAnimationFrame(settleBottomRafId);
+        settleBottomRafId = null;
+      }
+    };
+    const scheduleFollowBottom = () => {
+      cancelScheduledFollowBottom();
+      if (!auto_follow_bottom || !shouldFollowBottomRef.current) {
+        syncFollowState(false);
+        return;
+      }
+      followBottomRafId = window.requestAnimationFrame(() => {
+        followBottomRafId = null;
+        settleBottomRafId = window.requestAnimationFrame(() => {
+          settleBottomRafId = null;
+          holder.scrollTop = holder.scrollHeight;
+          syncFollowState(false);
+        });
+      });
+    };
     const handleScroll = () => {
       userScrollTriggeredRef.current = true;
       syncFollowState(true);
     };
     holder.addEventListener("scroll", handleScroll, { passive: true });
 
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(() => {
+        scheduleFollowBottom();
+      });
+      resizeObserver.observe(holder);
+      const holderInner = holder.querySelector<HTMLElement>(".rc-virtual-list-holder-inner");
+      if (holderInner) {
+        resizeObserver.observe(holderInner);
+      }
+    }
+    scheduleFollowBottom();
+
     return () => {
+      cancelScheduledFollowBottom();
+      resizeObserver?.disconnect();
       holder.removeEventListener("scroll", handleScroll);
       if (holderRef.current === holder) {
         holderRef.current = null;
       }
     };
-  }, [listHeight, items.length, on_follow_bottom_change, on_reach_bottom, on_reach_top]);
+  }, [auto_follow_bottom, listHeight, items.length, on_follow_bottom_change, on_reach_bottom, on_reach_top]);
 
   useEffect(() => {
     if (!auto_follow_bottom) {
@@ -363,12 +442,21 @@ function SyncEntryPreviewList({
       return;
     }
 
+    let settleRafId: number | null = null;
     const rafId = window.requestAnimationFrame(() => {
-      holder.scrollTop = holder.scrollHeight;
+      settleRafId = window.requestAnimationFrame(() => {
+        settleRafId = null;
+        holder.scrollTop = holder.scrollHeight;
+      });
     });
 
-    return () => window.cancelAnimationFrame(rafId);
-  }, [auto_follow_bottom, rows.length]);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      if (settleRafId !== null) {
+        window.cancelAnimationFrame(settleRafId);
+      }
+    };
+  }, [auto_follow_bottom, listHeight, rows.length]);
 
   useEffect(() => {
     userScrollTriggeredRef.current = false;
@@ -561,7 +649,7 @@ function SyncEntryPreviewList({
                           <Typography.Text type="secondary">-</Typography.Text>
                         )}
 
-                        {expandable || item.preview_truncated ? (
+                        {expandable || item.preview_truncated || on_request_full_content ? (
                           <div className="sync-preview-actions">
                             {expandable ? (
                               <Button
@@ -578,24 +666,23 @@ function SyncEntryPreviewList({
                             ) : null}
 
                             {item.preview_truncated ? (
-                              <>
-                                <Tag color="warning" className="sync-preview-truncated-tag">
-                                  预览已截断
-                                </Tag>
-                                {on_request_full_content ? (
-                                  <Button
-                                    type="link"
-                                    size="small"
-                                    className="sync-preview-detail-btn"
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      void openFullContentModal(item);
-                                    }}
-                                  >
-                                    弹窗查看完整内容
-                                  </Button>
-                                ) : null}
-                              </>
+                              <Tag color="warning" className="sync-preview-truncated-tag">
+                                预览已截断
+                              </Tag>
+                            ) : null}
+
+                            {on_request_full_content ? (
+                              <Button
+                                type="link"
+                                size="small"
+                                className="sync-preview-detail-btn"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void openFullContentModal(item);
+                                }}
+                              >
+                                弹窗查看完整内容
+                              </Button>
                             ) : null}
                           </div>
                         ) : null}
@@ -615,6 +702,8 @@ function SyncEntryPreviewList({
         onCancel={closeDetailModal}
         footer={null}
         width={960}
+        centered
+        getContainer={() => document.body}
         destroyOnClose={false}
       >
         {detailItem ? (
@@ -640,7 +729,9 @@ function SyncEntryPreviewList({
             <Typography.Text type="danger">{detailModal.error}</Typography.Text>
           ) : detailResult ? (
             <div className="sync-preview-detail-markdown sync-preview-markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{detailResult.content}</ReactMarkdown>
+              <ReactMarkdown components={syncPreviewMarkdownComponents} remarkPlugins={[remarkGfm]}>
+                {detailResult.content}
+              </ReactMarkdown>
             </div>
           ) : null}
         </div>

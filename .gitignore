@@ -3,3 +3,6 @@ dist
 src-tauri/target
 *.log
 .DS_Store
+.claude/
+src/App copy.tsx
+src/styles copy.css

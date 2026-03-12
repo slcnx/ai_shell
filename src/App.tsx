@@ -1,6 +1,8 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emitTo, listen } from "@tauri-apps/api/event";
+import { WebviewWindow, getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { LogicalSize, PhysicalPosition, getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "xterm";
 import type { IDisposable } from "xterm";
@@ -37,6 +39,7 @@ import {
   CompressOutlined,
   FolderOpenOutlined,
   PlusOutlined,
+  PushpinOutlined,
   SearchOutlined,
   SendOutlined,
   SettingOutlined,
@@ -48,13 +51,353 @@ import SyncEntryPreviewList, {
   type SyncEntryPreviewItem
 } from "./components/SyncEntryPreviewList";
 import SessionCandidateCard from "./components/SessionCandidateCard";
+import SessionCandidateVirtualList from "./components/SessionCandidateVirtualList";
 import JsonPathTree, { type JsonPathToken } from "./components/JsonPathTree";
+import AiTeamMcpPage, { type AiTeamWorkbenchHeaderActions } from "./pages/AiTeamMcpPage";
 import defaultAssistantAvatar from "../ai.jpg";
 import defaultUserAvatar from "../man.jpg";
 
 type Provider = string;
 type LayoutMode = "vertical" | "horizontal";
 type UiColorMode = "dark" | "light" | "system";
+type AppRoute = "workspace" | "team" | "ai-team" | "session-preview";
+type StandaloneSessionPreviewTargetPayload = {
+  paneId: string;
+};
+
+const STANDALONE_SESSION_PREVIEW_WINDOW_LABEL = "session-preview";
+const STANDALONE_SESSION_PREVIEW_SET_PANE_EVENT = "session-preview:set-pane";
+const STANDALONE_SESSION_PREVIEW_ALWAYS_ON_TOP_STORAGE_KEY =
+  "ai-shell.session-preview.always-on-top";
+const STANDALONE_SESSION_PREVIEW_DEFAULT_WIDTH = 1180;
+const STANDALONE_SESSION_PREVIEW_DEFAULT_HEIGHT = 820;
+const STANDALONE_SESSION_PREVIEW_MIN_WIDTH = 360;
+const STANDALONE_SESSION_PREVIEW_MIN_HEIGHT = 420;
+const STANDALONE_SESSION_PREVIEW_COMPACT_TARGET_WIDTH = 420;
+const STANDALONE_SESSION_PREVIEW_COMPACT_TARGET_HEIGHT = 620;
+const STANDALONE_SESSION_PREVIEW_ANCHOR_MARGIN = 24;
+const FRONTEND_SID_PROBE_BUFFER_MAX_CHARS = 256 * 1024;
+const DEFAULT_INLINE_PREVIEW_PANEL_HEIGHT = 300;
+const MIN_INLINE_PREVIEW_PANEL_HEIGHT = 180;
+const MIN_INLINE_TERMINAL_SECTION_HEIGHT = 180;
+const INLINE_PREVIEW_SPLITTER_HEIGHT = 12;
+
+function normalizeAppPathname(pathname: string): string {
+  if (!pathname) {
+    return "/";
+  }
+  const trimmed = pathname.trim();
+  if (!trimmed || trimmed === "/") {
+    return "/";
+  }
+  if (trimmed.endsWith("/index.html")) {
+    return "/";
+  }
+  const normalized = trimmed.replace(/\/+$/g, "");
+  return normalized || "/";
+}
+
+function resolveAppRouteFromPath(pathname: string): AppRoute | null {
+  const normalized = normalizeAppPathname(pathname);
+  if (normalized === "/session-preview") {
+    return "session-preview";
+  }
+  if (normalized === "/team") {
+    return "team";
+  }
+  if (normalized === "/ai-team") {
+    return "ai-team";
+  }
+  if (normalized === "/") {
+    return "workspace";
+  }
+  return null;
+}
+
+function resolveAppRouteFromHash(hash: string): AppRoute | null {
+  const trimmed = (hash || "").trim();
+  if (!trimmed || trimmed === "#") {
+    return "workspace";
+  }
+  const normalized = trimmed.replace(/\/+$/g, "");
+  if (normalized === "#") {
+    return "workspace";
+  }
+  if (normalized === "#/session-preview") {
+    return "session-preview";
+  }
+  if (normalized === "#/team") {
+    return "team";
+  }
+  if (normalized === "#/ai-team") {
+    return "ai-team";
+  }
+  if (normalized === "#/" || normalized === "#/workspace") {
+    return "workspace";
+  }
+  return null;
+}
+
+function resolveAppRoute(): AppRoute {
+  return resolveAppRouteFromPath(window.location.pathname)
+    ?? resolveAppRouteFromHash(window.location.hash)
+    ?? "workspace";
+}
+
+function resolveStandaloneSessionPreviewPaneIdFromSearch(search: string): string {
+  const params = new URLSearchParams(search || "");
+  return String(params.get("paneId") || "").trim();
+}
+
+function buildStandaloneSessionPreviewUrl(paneId: string): string {
+  const params = new URLSearchParams();
+  const normalizedPaneId = paneId.trim();
+  if (normalizedPaneId) {
+    params.set("paneId", normalizedPaneId);
+  }
+  const query = params.toString();
+  return query ? `/session-preview?${query}` : "/session-preview";
+}
+
+function readStandaloneSessionPreviewAlwaysOnTopPreference(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return localStorage.getItem(STANDALONE_SESSION_PREVIEW_ALWAYS_ON_TOP_STORAGE_KEY) === "1";
+}
+
+function writeStandaloneSessionPreviewAlwaysOnTopPreference(value: boolean) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  localStorage.setItem(
+    STANDALONE_SESSION_PREVIEW_ALWAYS_ON_TOP_STORAGE_KEY,
+    value ? "1" : "0"
+  );
+}
+
+function resolveRightCenteredWindowPhysicalPosition(params: {
+  hostX: number;
+  hostY: number;
+  hostWidth: number;
+  hostHeight: number;
+  popupWidth: number;
+  popupHeight: number;
+  margin?: number;
+}) {
+  const margin = params.margin ?? STANDALONE_SESSION_PREVIEW_ANCHOR_MARGIN;
+  const minX = params.hostX + margin;
+  const minY = params.hostY + margin;
+  const maxX = Math.max(minX, params.hostX + params.hostWidth - params.popupWidth - margin);
+  const maxY = Math.max(minY, params.hostY + params.hostHeight - params.popupHeight - margin);
+  const desiredX = params.hostX + params.hostWidth - params.popupWidth - margin;
+  const desiredY = params.hostY + Math.round((params.hostHeight - params.popupHeight) / 2);
+
+  return {
+    x: Math.max(minX, Math.min(desiredX, maxX)),
+    y: Math.max(minY, Math.min(desiredY, maxY))
+  };
+}
+
+function resolveStandaloneSessionPreviewCompactLogicalSize(
+  hostWidth: number,
+  hostHeight: number
+) {
+  const availableWidth = Math.max(STANDALONE_SESSION_PREVIEW_MIN_WIDTH, hostWidth - STANDALONE_SESSION_PREVIEW_ANCHOR_MARGIN * 2);
+  const availableHeight = Math.max(STANDALONE_SESSION_PREVIEW_MIN_HEIGHT, hostHeight - STANDALONE_SESSION_PREVIEW_ANCHOR_MARGIN * 2);
+  const scale = Math.min(
+    1,
+    availableWidth / STANDALONE_SESSION_PREVIEW_COMPACT_TARGET_WIDTH,
+    availableHeight / STANDALONE_SESSION_PREVIEW_COMPACT_TARGET_HEIGHT
+  );
+
+  return {
+    width: Math.max(
+      STANDALONE_SESSION_PREVIEW_MIN_WIDTH,
+      Math.round(STANDALONE_SESSION_PREVIEW_COMPACT_TARGET_WIDTH * scale)
+    ),
+    height: Math.max(
+      STANDALONE_SESSION_PREVIEW_MIN_HEIGHT,
+      Math.round(STANDALONE_SESSION_PREVIEW_COMPACT_TARGET_HEIGHT * scale)
+    )
+  };
+}
+
+function sanitizeTerminalProbeText(content: string): string {
+  return content
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[@-_]/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\u0008/g, "")
+    .replace(/\u0000/g, "");
+}
+
+function appendTerminalProbeText(current: string, incoming: string): string {
+  const next = `${current}${incoming}`;
+  return next.length > FRONTEND_SID_PROBE_BUFFER_MAX_CHARS
+    ? next.slice(-FRONTEND_SID_PROBE_BUFFER_MAX_CHARS)
+    : next;
+}
+
+type FrontendSidProbeProfile = {
+  command: string;
+  timeout_ms: number;
+  poll_ms: number;
+  key_delay_ms?: number;
+  ready_timeout_ms?: number;
+  prompt_patterns?: RegExp[];
+  slash_mode_patterns?: RegExp[];
+  slash_activation_delay_ms?: number;
+  submit_delay_ms?: number;
+  cleanup_data?: string;
+  patterns: RegExp[];
+  ready_patterns?: RegExp[];
+};
+
+function sidProbeProfileForProvider(provider: string): FrontendSidProbeProfile | null {
+  const normalized = provider.trim().toLowerCase();
+  if (normalized === "codex") {
+    return {
+      command: "/status",
+      timeout_ms: 6000,
+      poll_ms: 150,
+      key_delay_ms: 36,
+      ready_timeout_ms: 12000,
+      prompt_patterns: [/(?:^|\n)[>›❯]\s*$/m],
+      slash_mode_patterns: [/(?:^|\n)[>›❯]\s*\/.*$/m, /\/status(?:line)?\b/i],
+      slash_activation_delay_ms: 260,
+      submit_delay_ms: 120,
+      patterns: [
+        /Session\s*:\s*([0-9a-fA-F-]{36})\b/i,
+        /(?:^|\n)[^\n]*[•|]\s*([0-9a-fA-F-]{36})\s*$/im,
+        /\b([0-9a-fA-F-]{36})\b/i
+      ],
+      ready_patterns: [/OpenAI\s+Codex/i]
+    };
+  }
+  if (normalized === "claude") {
+    return {
+      command: "/status",
+      timeout_ms: 6000,
+      poll_ms: 150,
+      key_delay_ms: 28,
+      cleanup_data: "\u001b",
+      ready_timeout_ms: 12000,
+      slash_activation_delay_ms: 180,
+      submit_delay_ms: 100,
+      patterns: [/Session ID\s*:\s*([0-9a-fA-F-]{36})\b/i],
+      ready_patterns: [/claude/i]
+    };
+  }
+  if (normalized === "gemini") {
+    return {
+      command: "/stats session",
+      timeout_ms: 6000,
+      poll_ms: 150,
+      key_delay_ms: 28,
+      ready_timeout_ms: 12000,
+      slash_activation_delay_ms: 180,
+      submit_delay_ms: 100,
+      patterns: [/Session ID\s*:\s*([0-9a-fA-F-]{36})\b/i],
+      ready_patterns: [/\bgemini\b/i]
+    };
+  }
+  return null;
+}
+
+function inferSidProbeProviderFromText(text: string, fallbackProvider: string): string {
+  const normalizedFallback = fallbackProvider.trim().toLowerCase();
+  const normalized = sanitizeTerminalProbeText(text).toLowerCase();
+  if (!normalized) {
+    return normalizedFallback;
+  }
+  if (
+    normalized.includes("openai codex")
+    || normalized.includes("new build faster with codex")
+    || normalized.includes("/model to change")
+  ) {
+    return "codex";
+  }
+  if (/\bgemini\b/i.test(normalized)) {
+    return "gemini";
+  }
+  if (/\bclaude\b/i.test(normalized)) {
+    return "claude";
+  }
+  return normalizedFallback;
+}
+
+function resolveSidProbeProfile(
+  provider: string,
+  observedText = ""
+): { provider: string; profile: FrontendSidProbeProfile } | null {
+  const inferredProvider = inferSidProbeProviderFromText(observedText, provider);
+  const inferredProfile = sidProbeProfileForProvider(inferredProvider);
+  if (inferredProfile) {
+    return { provider: inferredProvider, profile: inferredProfile };
+  }
+  const normalizedProvider = provider.trim().toLowerCase();
+  const fallbackProfile = sidProbeProfileForProvider(normalizedProvider);
+  if (!fallbackProfile) {
+    return null;
+  }
+  return {
+    provider: normalizedProvider,
+    profile: fallbackProfile
+  };
+}
+
+function extractSidFromTerminalProbeText(text: string, provider: string): string {
+  const profile = sidProbeProfileForProvider(provider);
+  if (!profile) {
+    return "";
+  }
+  const normalized = sanitizeTerminalProbeText(text);
+  for (const pattern of profile.patterns) {
+    const matched = normalized.match(pattern);
+    const value = matched?.[1]?.trim() || "";
+    if (value) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function readTerminalScreenText(term: Terminal, maxLines = 240): string {
+  const buffer = term.buffer.active;
+  const start = Math.max(0, buffer.length - maxLines);
+  const lines: string[] = [];
+  for (let index = start; index < buffer.length; index += 1) {
+    lines.push(buffer.getLine(index)?.translateToString(true) || "");
+  }
+  return sanitizeTerminalProbeText(lines.join("\n"));
+}
+
+function isProviderInteractiveReady(screenText: string, provider: string): boolean {
+  const profile = sidProbeProfileForProvider(provider);
+  if (!profile?.ready_patterns?.length) {
+    return true;
+  }
+  return profile.ready_patterns.some((pattern) => pattern.test(screenText));
+}
+
+function isProviderInputPromptReady(screenText: string, provider: string): boolean {
+  const profile = sidProbeProfileForProvider(provider);
+  if (!profile?.prompt_patterns?.length) {
+    return true;
+  }
+  return profile.prompt_patterns.some((pattern) => pattern.test(screenText));
+}
+
+function isProviderSlashModeReady(screenText: string, provider: string): boolean {
+  const profile = sidProbeProfileForProvider(provider);
+  if (!profile?.slash_mode_patterns?.length) {
+    return true;
+  }
+  return profile.slash_mode_patterns.some((pattern) => pattern.test(screenText));
+}
 
 type PaneSummary = {
   id: string;
@@ -87,6 +430,8 @@ type NativeSessionCandidate = {
   source_files: number;
   record_count: number;
   first_input: string;
+  synthetic?: boolean;
+  synthetic_reason?: string;
 };
 
 type NativeSessionListResponse = {
@@ -204,6 +549,18 @@ type PaneTerminal = {
   resizeObserver: ResizeObserver;
   element: HTMLDivElement;
   focusHandler: () => void;
+  disposed: boolean;
+};
+
+type PaneOutputProbeState = {
+  revision: number;
+  text: string;
+};
+
+type PanePreviewResizeState = {
+  paneId: string;
+  startY: number;
+  originHeight: number;
 };
 
 type SendDialogState = {
@@ -235,6 +592,8 @@ type CreatePaneDialogState = {
   custom_provider: string;
   title_mode: "auto" | "custom";
   custom_title: string;
+  team_directory: string;
+  team_role_count: number;
   session_parse_preset: string;
   session_scan_glob: string;
   session_parse_json: string;
@@ -246,6 +605,7 @@ type SessionManageDialogState = {
   active_session_id: string;
   linked_session_ids: string[];
   saving: boolean;
+  view_mode: "manage" | "list";
 };
 
 type SessionManagePreviewState = {
@@ -255,9 +615,12 @@ type SessionManagePreviewState = {
   preview_total_rows: number;
   preview_loaded_rows: number;
   preview_has_more: boolean;
+  preview_from_end: boolean;
 };
 
 type SessionManageGroupTabKey = "current" | "linked" | "unlinked";
+
+type PreviewOverlaySource = "session-manage" | "sync-dialog";
 
 type SessionListDialogState = {
   open: boolean;
@@ -285,6 +648,8 @@ type SessionListDialogState = {
   preview_loaded_rows: number;
   preview_has_more: boolean;
   preview_from_end: boolean;
+  preview_auto_refresh: boolean;
+  preview_panel_height: number;
   unrecognized_files: NativeSessionUnrecognizedFile[];
 };
 
@@ -463,6 +828,9 @@ const DEFAULT_COMPRESS_CONFIG: CompressConfig = {
   max_chars: 8000,
   summary_chars: 1600
 };
+
+const TEAM_WORK_DIR_NAME = "work";
+const TEAM_CODE_DIR_NAME = "code";
 
 function asTitle(provider: string): string {
   const normalized = provider.trim().toLowerCase();
@@ -984,6 +1352,21 @@ function normalizeOptionalNonNegativeInt(value: number | null | undefined): numb
   return Math.max(0, Math.floor(num));
 }
 
+function joinFilesystemPath(base: string, segment: string): string {
+  const trimmedBase = base.trim();
+  const trimmedSegment = segment.trim();
+  if (!trimmedBase) {
+    return trimmedSegment;
+  }
+  if (!trimmedSegment) {
+    return trimmedBase;
+  }
+  const separator = trimmedBase.includes("\\") && !trimmedBase.includes("/") ? "\\" : "/";
+  const normalizedBase = trimmedBase.replace(/[\\/]+$/g, "");
+  const normalizedSegment = trimmedSegment.replace(/^[\\/]+/g, "");
+  return `${normalizedBase}${separator}${normalizedSegment}`;
+}
+
 function splitSessionSortMode(mode: SessionSortMode): { field: SessionSortField; order: SessionSortOrder } {
   if (mode === "created_asc") {
     return { field: "created", order: "asc" };
@@ -1257,6 +1640,28 @@ function compareEntryByTime(a: EntryRecord, b: EntryRecord): number {
   return a.id.localeCompare(b.id);
 }
 
+function compareNativePreviewRowByTime(a: NativeSessionPreviewRow, b: NativeSessionPreviewRow): number {
+  if (a.created_at !== b.created_at) {
+    return a.created_at - b.created_at;
+  }
+  return a.id.localeCompare(b.id);
+}
+
+function mergeNativePreviewRows(
+  ...groups: Array<NativeSessionPreviewRow[] | null | undefined>
+): NativeSessionPreviewRow[] {
+  const merged = new Map<string, NativeSessionPreviewRow>();
+  for (const group of groups) {
+    for (const row of group || []) {
+      if (!row?.id) {
+        continue;
+      }
+      merged.set(row.id, row);
+    }
+  }
+  return [...merged.values()].sort(compareNativePreviewRowByTime);
+}
+
 function pickEntriesBySyncStrategyPerSession(
   entries: EntryRecord[],
   strategy: SyncStrategy,
@@ -1525,7 +1930,9 @@ function createUnrecognizedFilesModalState(): UnrecognizedFilesModalState {
 
 function createCreatePaneDialogState(
   provider = "codex",
-  parserProfiles: SessionParserProfileSummary[] = []
+  parserProfiles: SessionParserProfileSummary[] = [],
+  teamDirectory = "",
+  teamRoleCount = 2
 ): CreatePaneDialogState {
   const normalizedProvider = provider.trim().toLowerCase();
   const presetProvider = isBuiltinProvider(normalizedProvider) ? normalizedProvider : "codex";
@@ -1538,6 +1945,8 @@ function createCreatePaneDialogState(
     custom_provider: isBuiltinProvider(normalizedProvider) ? "" : normalizedProvider,
     title_mode: "auto",
     custom_title: "",
+    team_directory: teamDirectory,
+    team_role_count: Math.max(1, Math.min(20, Math.round(teamRoleCount || 2))),
     session_parse_preset: parsePreset,
     session_scan_glob: normalizeSessionScanGlobInput(
       defaultSessionScanGlobByPreset(parsePreset, parserProfiles)
@@ -1552,7 +1961,8 @@ function createSessionManageDialogState(): SessionManageDialogState {
     pane_id: "",
     active_session_id: "",
     linked_session_ids: [],
-    saving: false
+    saving: false,
+    view_mode: "manage"
   };
 }
 
@@ -1563,7 +1973,8 @@ function createSessionManagePreviewState(): SessionManagePreviewState {
     preview_rows: [],
     preview_total_rows: 0,
     preview_loaded_rows: 0,
-    preview_has_more: false
+    preview_has_more: false,
+    preview_from_end: true
   };
 }
 
@@ -1594,6 +2005,8 @@ function createSessionListDialogState(): SessionListDialogState {
     preview_loaded_rows: 0,
     preview_has_more: false,
     preview_from_end: true,
+    preview_auto_refresh: false,
+    preview_panel_height: DEFAULT_INLINE_PREVIEW_PANEL_HEIGHT,
     unrecognized_files: []
   };
 }
@@ -1685,8 +2098,57 @@ function groupSessionCandidates(
   return { current, linked, unlinked };
 }
 
+function createSyntheticBoundSessionCandidate(
+  sessionId: string,
+  kind: "current" | "linked"
+): NativeSessionCandidate {
+  const label = kind === "current" ? "当前 SID" : "关联 SID";
+  return {
+    provider: "",
+    session_id: sessionId.trim(),
+    started_at: 0,
+    last_seen_at: 0,
+    source_files: 0,
+    record_count: 0,
+    first_input: `${label} 已绑定，但当前扫描结果里还没有发现这个会话。通常是会话尚未落盘，或索引还没刷新到。`,
+    synthetic: true,
+    synthetic_reason: "未入索引"
+  };
+}
+
+function groupSessionCandidatesForManage(
+  items: NativeSessionCandidate[],
+  activeSessionId: string,
+  linkedSessionIds: string[]
+): { current: NativeSessionCandidate[]; linked: NativeSessionCandidate[]; unlinked: NativeSessionCandidate[] } {
+  const grouped = groupSessionCandidates(items, activeSessionId, linkedSessionIds);
+  const active = activeSessionId.trim();
+  const linked = parseSessionIds(linkedSessionIds);
+  const indexedSet = new Set(items.map((item) => item.session_id.trim()).filter(Boolean));
+
+  if (active && !indexedSet.has(active)) {
+    grouped.current = [createSyntheticBoundSessionCandidate(active, "current"), ...grouped.current];
+  }
+
+  const missingLinked = linked
+    .filter((sessionId) => sessionId && sessionId !== active && !indexedSet.has(sessionId))
+    .map((sessionId) => createSyntheticBoundSessionCandidate(sessionId, "linked"));
+  if (missingLinked.length) {
+    grouped.linked = [...missingLinked, ...grouped.linked];
+  }
+
+  return grouped;
+}
+
 function App() {
   const [messageApi, contextHolder] = message.useMessage();
+  const [route, setRoute] = useState<AppRoute>(() => resolveAppRoute());
+  const [standaloneSessionPreviewPaneId, setStandaloneSessionPreviewPaneId] = useState(() =>
+    typeof window !== "undefined" ? resolveStandaloneSessionPreviewPaneIdFromSearch(window.location.search) : ""
+  );
+  const isTeamRoute = route === "team";
+  const isStandaloneSessionPreviewRoute = route === "session-preview";
+  const isWorkspaceLikeRoute = route === "workspace" || route === "team";
   const [loading, setLoading] = useState(true);
   const [layoutMode, setLayoutMode] = useState<LayoutMode>("vertical");
   const [providers, setProviders] = useState<Provider[]>(FALLBACK_PROVIDERS);
@@ -1694,12 +2156,35 @@ function App() {
   const [panes, setPanes] = useState<PaneView[]>([]);
   const [activePaneId, setActivePaneId] = useState("");
 
+  const navigateTo = useCallback((target: AppRoute) => {
+    const path =
+      target === "team"
+        ? "/team"
+        : target === "ai-team"
+          ? "/ai-team"
+          : target === "session-preview"
+            ? "/session-preview"
+            : "/";
+    const currentPath = normalizeAppPathname(window.location.pathname);
+    if (currentPath !== path) {
+      try {
+        window.history.pushState({}, "", `${path}${window.location.search || ""}`);
+      } catch {
+        window.location.hash = path === "/" ? "#/" : `#${path}`;
+      }
+    }
+    setRoute(target);
+  }, []);
+
   const [configOpen, setConfigOpen] = useState(false);
   const [configTab, setConfigTab] = useState("theme");
 
   const [uiThemePreset, setUiThemePreset] = useState(DEFAULT_THEME_PRESET);
   const [uiSkinHue, setUiSkinHue] = useState(DEFAULT_SKIN_HUE);
   const [uiSkinAccent, setUiSkinAccent] = useState(DEFAULT_SKIN_ACCENT);
+  const [isCompactViewport, setIsCompactViewport] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth <= 960 : false
+  );
   const [uiColorMode, setUiColorMode] = useState<UiColorMode>(() =>
     normalizeColorMode(localStorage.getItem(STORAGE_COLOR_MODE_KEY))
   );
@@ -1725,6 +2210,49 @@ function App() {
       return { ...DEFAULT_COMPRESS_CONFIG };
     }
   });
+
+  useEffect(() => {
+    const handleLocationChange = () => {
+      setRoute(resolveAppRoute());
+      setStandaloneSessionPreviewPaneId(resolveStandaloneSessionPreviewPaneIdFromSearch(window.location.search));
+    };
+    window.addEventListener("hashchange", handleLocationChange);
+    window.addEventListener("popstate", handleLocationChange);
+    return () => {
+      window.removeEventListener("hashchange", handleLocationChange);
+      window.removeEventListener("popstate", handleLocationChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setIsCompactViewport(window.innerWidth <= 960);
+    };
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (route !== "ai-team") {
+      setAiTeamHeaderActions(null);
+    }
+  }, [route]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (route === "session-preview") {
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") {
+        event.preventDefault();
+        const nextRoute = route === "team" ? "workspace" : "team";
+        navigateTo(nextRoute);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [navigateTo, route]);
 
   const [createPaneDialog, setCreatePaneDialog] = useState<CreatePaneDialogState>(() =>
     createCreatePaneDialogState(FALLBACK_PROVIDERS[0], [])
@@ -1764,10 +2292,22 @@ function App() {
   const [syncDialogPreview, setSyncDialogPreview] = useState<SyncDialogPreviewState>(() =>
     createSyncDialogPreviewState()
   );
+  const [previewOverlaySource, setPreviewOverlaySource] = useState<PreviewOverlaySource | null>(null);
+  const [sessionManagePreviewScrollCommand, setSessionManagePreviewScrollCommand] = useState<
+    { target: "top" | "bottom"; nonce: number } | null
+  >(null);
   const [syncDialogPreviewScrollCommand, setSyncDialogPreviewScrollCommand] = useState<
     { target: "top" | "bottom"; nonce: number } | null
   >(null);
   const [syncShowSelectedOnly, setSyncShowSelectedOnly] = useState(false);
+  const [clearingAllSid, setClearingAllSid] = useState(false);
+  const [aiTeamHeaderActions, setAiTeamHeaderActions] = useState<AiTeamWorkbenchHeaderActions | null>(null);
+  const [standaloneSessionPreviewAlwaysOnTop, setStandaloneSessionPreviewAlwaysOnTop] = useState(() =>
+    readStandaloneSessionPreviewAlwaysOnTopPreference()
+  );
+  const [standaloneSessionPreviewCompactMode, setStandaloneSessionPreviewCompactMode] = useState(false);
+  const standaloneSessionPreviewAutoRefreshRunningRef = useRef(false);
+  const standaloneSessionPreviewRestoreSizeRef = useRef<{ width: number; height: number } | null>(null);
   const sessionManagePreviewTicketRef = useRef(0);
   const syncDialogPreviewTicketRef = useRef(0);
   const syncDialogEntryCacheRef = useRef<Map<string, EntryRecord[]>>(new Map());
@@ -1776,9 +2316,36 @@ function App() {
   const sessionPreviewFollowBottomRef = useRef<Map<string, boolean>>(new Map());
   const sessionListLoadTicketRef = useRef<Map<string, number>>(new Map());
   const sessionPreviewLoadTicketRef = useRef<Map<string, number>>(new Map());
+  const paneSessionIndexSyncTicketRef = useRef<Map<string, number>>(new Map());
+  const reloadSessionListDialogRef = useRef<
+    | null
+    | ((
+        paneId: string,
+        overrides?: Partial<
+          Pick<
+            SessionListDialogState,
+            "sid_keyword" | "time_from" | "time_to" | "quick_time_preset" | "records_min" | "records_max"
+          >
+        >,
+        requestOptions?: {
+          fullLoad?: boolean;
+          keepPanelClosed?: boolean;
+        }
+      ) => Promise<void>)
+  >(null);
   const [syncDialog, setSyncDialog] = useState<SyncDialogState>(() => createSyncDialogState());
 
   const terminalsRef = useRef<Map<string, PaneTerminal>>(new Map());
+  const paneOutputProbeRef = useRef<Map<string, PaneOutputProbeState>>(new Map());
+  const sidProbeTokenRef = useRef<Map<string, number>>(new Map());
+  const paneSplitContainerRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const panePreviewResizeStateRef = useRef<PanePreviewResizeState | null>(null);
+  const panePreviewAutoRefreshTimerRef = useRef<Map<string, number>>(new Map());
+  const panePreviewAutoRefreshRunningRef = useRef<Set<string>>(new Set());
+  const sessionManageAutoRefreshTimerRef = useRef<number | null>(null);
+  const sessionManageAutoRefreshRunningRef = useRef(false);
+  const queuePanePreviewAutoRefreshRef = useRef<(paneId: string) => void>(() => {});
+  const queueSessionManageAutoRefreshRef = useRef<(paneId: string) => void>(() => {});
   const terminalRefCallbacks = useRef<Map<string, (element: HTMLDivElement | null) => void>>(new Map());
   const createPaneSampleTicketRef = useRef(0);
   const sessionPanelBootRef = useRef(false);
@@ -2468,9 +3035,24 @@ function App() {
         : null,
     [sessionListPanels, sessionManageDialog.pane_id]
   );
+  const standaloneSessionPreviewPane = useMemo(
+    () => panes.find((pane) => pane.id === standaloneSessionPreviewPaneId) ?? null,
+    [panes, standaloneSessionPreviewPaneId]
+  );
+  const standaloneSessionPreviewListState = useMemo(
+    () =>
+      standaloneSessionPreviewPaneId
+        ? sessionListPanels[standaloneSessionPreviewPaneId] ?? {
+            ...createSessionListDialogState(),
+            pane_id: standaloneSessionPreviewPaneId
+          }
+        : null,
+    [sessionListPanels, standaloneSessionPreviewPaneId]
+  );
+  const sessionManageIsListView = sessionManageDialog.view_mode === "list";
   const sessionManageGroupedItems = useMemo(
     () =>
-      groupSessionCandidates(
+      groupSessionCandidatesForManage(
         sessionManageListState?.items ?? [],
         sessionManagePane?.active_session_id ?? "",
         sessionManagePane?.linked_session_ids ?? []
@@ -2481,6 +3063,138 @@ function App() {
       sessionManagePane?.linked_session_ids
     ]
   );
+  const sessionManageMissingCurrentIndexed = useMemo(() => {
+    const active = sessionManagePane?.active_session_id.trim() ?? "";
+    if (!active) {
+      return false;
+    }
+    return sessionManageGroupedItems.current.some(
+      (item) => item.synthetic && item.session_id.trim() === active
+    );
+  }, [sessionManageGroupedItems.current, sessionManagePane?.active_session_id]);
+  const sessionManageMissingLinkedCount = useMemo(
+    () => sessionManageGroupedItems.linked.filter((item) => item.synthetic).length,
+    [sessionManageGroupedItems.linked]
+  );
+  const sessionManagePreviewItems = useMemo<SyncEntryPreviewItem[]>(
+    () =>
+      sessionManagePreview.preview_rows.map((row, index) => ({
+        id: row.id || `${row.created_at}-${index}-${row.kind}`,
+        kind: row.kind,
+        content: row.content,
+        created_at_text: formatTs(row.created_at),
+        sid_text: sessionManagePreview.preview_session_id
+          ? shortSessionId(sessionManagePreview.preview_session_id)
+          : "-",
+        included: true,
+        preview_truncated: Boolean(row.preview_truncated)
+      })),
+    [sessionManagePreview.preview_rows, sessionManagePreview.preview_session_id]
+  );
+  const resolveSyncDialogPreviewItemSessionId = useCallback(
+    (item: Pick<SyncEntryPreviewItem, "id" | "kind" | "content">): string => {
+      if (syncDialogPreviewSessionId) {
+        return syncDialogPreviewSessionId;
+      }
+
+      const matchedEntry = syncDialog.entries.find((entry) => entry.id === item.id);
+      if (matchedEntry) {
+        return resolveEntrySessionId(matchedEntry, syncDialogCurrentSessionId) || "";
+      }
+
+      return resolveEntrySessionId(
+        {
+          id: item.id,
+          pane_id: syncDialog.pane_id,
+          kind: item.kind,
+          content: item.content,
+          synced_from: null,
+          created_at: 0
+        },
+        syncDialogCurrentSessionId
+      ) || "";
+    },
+    [
+      syncDialog.entries,
+      syncDialog.pane_id,
+      syncDialogCurrentSessionId,
+      syncDialogPreviewSessionId
+    ]
+  );
+  const syncDialogPreviewItems = useMemo<SyncEntryPreviewItem[]>(
+    () =>
+      syncDialogPreviewSessionId
+        ? syncDialogPreview.preview_rows.map((row, index) => {
+            const entryId = row.id || `${row.created_at}-${index}-${row.kind}`;
+            const previewEntry: EntryRecord = {
+              id: entryId,
+              pane_id: syncDialog.pane_id,
+              kind: row.kind,
+              content: row.content,
+              synced_from: buildNativePreviewTag(syncDialogPreviewSessionId),
+              created_at: row.created_at,
+              preview_truncated: Boolean(row.preview_truncated)
+            };
+            return {
+              id: entryId,
+              kind: row.kind,
+              content: row.content,
+              created_at_text: formatTs(row.created_at),
+              sid_text: shortSessionId(syncDialogPreviewSessionId),
+              included: isSyncDialogEntryIncluded(previewEntry),
+              preview_truncated: Boolean(row.preview_truncated)
+            };
+          })
+        : syncDialogPreviewPanelEntries.map((entry) => {
+            const sessionId = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+            return {
+              id: entry.id,
+              kind: entry.kind,
+              content: entry.content,
+              created_at_text: formatTs(entry.created_at),
+              sid_text: sessionId ? shortSessionId(sessionId) : "-",
+              included: isSyncDialogEntryIncluded(entry),
+              preview_truncated: Boolean(entry.preview_truncated)
+            };
+          }),
+    [
+      isSyncDialogEntryIncluded,
+      syncDialog.pane_id,
+      syncDialogCurrentSessionId,
+      syncDialogPreview.preview_rows,
+      syncDialogPreviewPanelEntries,
+      syncDialogPreviewSessionId
+    ]
+  );
+  const canOpenSessionManagePreviewOverlay = Boolean(
+    sessionManagePreview.preview_session_id.trim() ||
+      sessionManagePreview.preview_rows.length ||
+      sessionManagePreview.preview_loading
+  );
+  const canOpenSyncDialogPreviewOverlay = Boolean(
+    syncDialogPreviewSessionId ||
+      syncDialogFilteredEntries.length ||
+      syncDialog.loading ||
+      syncDialog.selected_session_ids.length
+  );
+  const previewOverlayTitle =
+    previewOverlaySource === "session-manage"
+      ? `${sessionManageIsListView ? "当前会话消息" : "会话预览"}弹窗`
+      : previewOverlaySource === "sync-dialog"
+        ? "同步预览弹窗"
+        : "预览弹窗";
+  const previewOverlayLoading =
+    previewOverlaySource === "session-manage"
+      ? sessionManagePreview.preview_loading && !sessionManagePreviewItems.length
+      : previewOverlaySource === "sync-dialog"
+        ? syncDialog.loading
+        : false;
+  const previewOverlayEmptyText =
+    previewOverlaySource === "session-manage"
+      ? "当前会话暂无预览消息"
+      : (syncDialogPreviewSessionId ? syncDialogPreview.preview_rows.length : syncDialogFilteredEntries.length)
+        ? "当前预览会话在筛选条件下暂无记录"
+        : "当前筛选下暂无可同步记录";
   const syncDialogGroupedItems = useMemo(
     () =>
       groupSessionCandidates(
@@ -2507,6 +3221,13 @@ function App() {
   const syncDialogSortState = useMemo(
     () => splitSessionSortMode(syncDialogSessionListState.sort_mode),
     [syncDialogSessionListState.sort_mode]
+  );
+  const panesWithSessionBindings = useMemo(
+    () =>
+      panes.filter(
+        (pane) => pane.active_session_id.trim().length > 0 || pane.linked_session_ids.length > 0
+      ),
+    [panes]
   );
   const sessionManageProgressState = useMemo(() => {
     const loadedSessions = Math.max(0, sessionManageListState?.items.length ?? 0);
@@ -2758,23 +3479,57 @@ function App() {
     if (!runtime) {
       return;
     }
+    runtime.disposed = true;
     runtime.dataDisposable.dispose();
     runtime.resizeObserver.disconnect();
     runtime.element.removeEventListener("focusin", runtime.focusHandler);
     runtime.term.dispose();
     terminalsRef.current.delete(paneId);
+    paneOutputProbeRef.current.delete(paneId);
+    sidProbeTokenRef.current.delete(paneId);
+    paneSplitContainerRef.current.delete(paneId);
+  }, []);
+
+  const fitTerminalRuntime = useCallback((paneId: string, runtime: PaneTerminal) => {
+    if (runtime.disposed || !runtime.element.isConnected) {
+      return;
+    }
+    const { clientWidth, clientHeight } = runtime.element;
+    if (clientWidth <= 0 || clientHeight <= 0) {
+      return;
+    }
+    try {
+      runtime.fit.fit();
+    } catch (error) {
+      console.error(error);
+      return;
+    }
+    void invoke<void>("resize_pane", {
+      paneId,
+      cols: runtime.term.cols,
+      rows: runtime.term.rows
+    }).catch((error) => console.error(error));
+  }, []);
+
+  const clampInlinePreviewPanelHeight = useCallback((paneId: string, requestedHeight: number): number => {
+    const container = paneSplitContainerRef.current.get(paneId);
+    const containerHeight = container?.clientHeight || 0;
+    if (containerHeight <= 0) {
+      return Math.max(MIN_INLINE_PREVIEW_PANEL_HEIGHT, Math.round(requestedHeight));
+    }
+    const maxHeight = Math.max(
+      MIN_INLINE_PREVIEW_PANEL_HEIGHT,
+      containerHeight - MIN_INLINE_TERMINAL_SECTION_HEIGHT - INLINE_PREVIEW_SPLITTER_HEIGHT
+    );
+    const minHeight = Math.min(MIN_INLINE_PREVIEW_PANEL_HEIGHT, maxHeight);
+    return Math.max(minHeight, Math.min(Math.round(requestedHeight), maxHeight));
   }, []);
 
   const fitAllTerminals = useCallback(() => {
     for (const [paneId, runtime] of terminalsRef.current.entries()) {
-      runtime.fit.fit();
-      void invoke<void>("resize_pane", {
-        paneId,
-        cols: runtime.term.cols,
-        rows: runtime.term.rows
-      }).catch((error) => console.error(error));
+      fitTerminalRuntime(paneId, runtime);
     }
-  }, []);
+  }, [fitTerminalRuntime]);
 
   const mountTerminal = useCallback(
     (paneId: string, element: HTMLDivElement | null) => {
@@ -2800,19 +3555,17 @@ function App() {
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(element);
-      fit.fit();
 
       const dataDisposable = term.onData((data) => {
         void invoke<void>("write_to_pane", { paneId, data }).catch((error) => console.error(error));
       });
 
       const resizeObserver = new ResizeObserver(() => {
-        fit.fit();
-        void invoke<void>("resize_pane", {
-          paneId,
-          cols: term.cols,
-          rows: term.rows
-        }).catch((error) => console.error(error));
+        const runtime = terminalsRef.current.get(paneId);
+        if (!runtime) {
+          return;
+        }
+        fitTerminalRuntime(paneId, runtime);
       });
       resizeObserver.observe(element);
 
@@ -2825,16 +3578,19 @@ function App() {
         dataDisposable,
         resizeObserver,
         element,
-        focusHandler
+        focusHandler,
+        disposed: false
       });
 
-      void invoke<void>("resize_pane", {
-        paneId,
-        cols: term.cols,
-        rows: term.rows
-      }).catch((error) => console.error(error));
+      window.requestAnimationFrame(() => {
+        const runtime = terminalsRef.current.get(paneId);
+        if (!runtime) {
+          return;
+        }
+        fitTerminalRuntime(paneId, runtime);
+      });
     },
-    [disposeTerminal]
+    [disposeTerminal, fitTerminalRuntime]
   );
 
   const getTerminalMountRef = useCallback(
@@ -2850,6 +3606,37 @@ function App() {
       return callback;
     },
     [mountTerminal]
+  );
+
+  const getPaneSplitContainerRef = useCallback((paneId: string) => {
+    return (element: HTMLDivElement | null) => {
+      if (!element) {
+        paneSplitContainerRef.current.delete(paneId);
+        return;
+      }
+      paneSplitContainerRef.current.set(paneId, element);
+    };
+  }, []);
+
+  const startPanePreviewResize = useCallback(
+    (
+      paneId: string,
+      event: {
+        clientY: number;
+        preventDefault: () => void;
+        stopPropagation: () => void;
+      }
+    ) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const panel = getSessionListPanelState(paneId);
+      panePreviewResizeStateRef.current = {
+        paneId,
+        startY: event.clientY,
+        originHeight: panel.preview_panel_height || DEFAULT_INLINE_PREVIEW_PANEL_HEIGHT
+      };
+    },
+    [getSessionListPanelState]
   );
 
   const updatePane = useCallback((paneId: string, updater: (pane: PaneView) => PaneView) => {
@@ -2996,10 +3783,100 @@ function App() {
         active_session_id: response.active_session_id || "",
         linked_session_ids: Array.isArray(response.linked_session_ids) ? response.linked_session_ids : []
       }));
+      const normalizedPaneId = paneId.trim();
+      if (normalizedPaneId) {
+        const nextTicket = (paneSessionIndexSyncTicketRef.current.get(normalizedPaneId) ?? 0) + 1;
+        paneSessionIndexSyncTicketRef.current.set(normalizedPaneId, nextTicket);
+        void (async () => {
+          try {
+            await refreshNativeSessionCache(normalizedPaneId);
+            if ((paneSessionIndexSyncTicketRef.current.get(normalizedPaneId) ?? 0) !== nextTicket) {
+              return;
+            }
+            const reloadSessionListDialogFn = reloadSessionListDialogRef.current;
+            if (!reloadSessionListDialogFn) {
+              return;
+            }
+            if (sessionManageDialog.open && sessionManageDialog.pane_id.trim() === normalizedPaneId) {
+              await reloadSessionListDialogFn(normalizedPaneId, undefined, {
+                fullLoad: true,
+                keepPanelClosed: true
+              });
+              return;
+            }
+            const panel = getSessionListPanelState(normalizedPaneId);
+            if (panel.open) {
+              await reloadSessionListDialogFn(normalizedPaneId, undefined, { keepPanelClosed: true });
+            }
+          } catch (error) {
+            console.error(error);
+          }
+        })();
+      }
       return response;
     },
-    [updatePane]
+    [
+      getSessionListPanelState,
+      refreshNativeSessionCache,
+      sessionManageDialog.open,
+      sessionManageDialog.pane_id,
+      updatePane
+    ]
   );
+
+  const clearAllPaneSessionBindings = useCallback(async () => {
+    if (clearingAllSid) {
+      return;
+    }
+    const targetPaneIds = panesWithSessionBindings.map((pane) => pane.id);
+    if (!targetPaneIds.length) {
+      messageApi.info("当前没有可清空的 SID");
+      return;
+    }
+    const confirmed = window.confirm(
+      `确认清空全部 ${targetPaneIds.length} 个窗格的当前 SID 和关联 SID？\n此操作不会删除会话历史。`
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      setClearingAllSid(true);
+      await Promise.all(targetPaneIds.map((paneId) => setPaneSessionState(paneId, "", [])));
+      for (const paneId of targetPaneIds) {
+        sessionPreviewFollowBottomRef.current.delete(paneId);
+        updateSessionListPanelState(paneId, (current) => ({
+          ...current,
+          preview_session_id: "",
+          preview_loading: false,
+          preview_rows: [],
+          preview_total_rows: 0,
+          preview_loaded_rows: 0,
+          preview_has_more: false,
+          preview_from_end: true
+        }));
+      }
+      if (sessionManageDialog.open && targetPaneIds.includes(sessionManageDialog.pane_id)) {
+        sessionManagePreviewTicketRef.current += 1;
+        setSessionManagePreview(createSessionManagePreviewState());
+        setSessionManagePreviewScrollCommand(null);
+        setSessionManageGroupTab("unlinked");
+      }
+      messageApi.success(`已清空 ${targetPaneIds.length} 个窗格的 SID 绑定`);
+    } catch (error) {
+      console.error(error);
+      messageApi.error("清空全部 SID 失败");
+    } finally {
+      setClearingAllSid(false);
+    }
+  }, [
+    clearingAllSid,
+    messageApi,
+    panesWithSessionBindings,
+    sessionManageDialog.open,
+    sessionManageDialog.pane_id,
+    setPaneSessionState,
+    updateSessionListPanelState
+  ]);
 
   const loadSessionCandidates = useCallback(
     async (
@@ -3112,7 +3989,7 @@ function App() {
           return [];
         });
 
-        if (!paneSummaries.length) {
+        if (!paneSummaries.length && !isStandaloneSessionPreviewRoute) {
           const defaultProvider = providerList[0] || FALLBACK_PROVIDERS[0];
           const summary = await invoke<PaneSummary>("create_pane", {
             provider: defaultProvider,
@@ -3127,14 +4004,18 @@ function App() {
 
         const nextPanes = paneSummaries.map(createPaneView);
         setPanes(nextPanes);
-        setActivePaneId(nextPanes[0]?.id || "");
+        const preferredPaneId =
+          nextPanes.find((pane) => pane.id === standaloneSessionPreviewPaneId)?.id || nextPanes[0]?.id || "";
+        setActivePaneId(isStandaloneSessionPreviewRoute ? preferredPaneId : nextPanes[0]?.id || "");
 
         for (const pane of nextPanes) {
-          void invoke<boolean>("ensure_pane_runtime", { paneId: pane.id }).catch((error) =>
-            console.error(error)
-          );
+          if (!isStandaloneSessionPreviewRoute) {
+            void invoke<boolean>("ensure_pane_runtime", { paneId: pane.id }).catch((error) =>
+              console.error(error)
+            );
+            void refreshScanProgress(pane.id);
+          }
           void hydratePaneSessionState(pane.id);
-          void refreshScanProgress(pane.id);
         }
       } catch (error) {
         console.error(error);
@@ -3151,7 +4032,24 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [hydratePaneSessionState, messageApi, refreshScanProgress]);
+  }, [
+    hydratePaneSessionState,
+    isStandaloneSessionPreviewRoute,
+    messageApi,
+    refreshScanProgress,
+    standaloneSessionPreviewPaneId
+  ]);
+
+  useEffect(() => {
+    if (!isStandaloneSessionPreviewRoute || !panes.length) {
+      return;
+    }
+    const normalizedPaneId = standaloneSessionPreviewPaneId.trim();
+    if (normalizedPaneId && panes.some((pane) => pane.id === normalizedPaneId)) {
+      return;
+    }
+    setStandaloneSessionPreviewPaneId(activePaneId || panes[0]?.id || "");
+  }, [activePaneId, isStandaloneSessionPreviewRoute, panes, standaloneSessionPreviewPaneId]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_COLOR_MODE_KEY, uiColorMode);
@@ -3212,7 +4110,27 @@ function App() {
         if (!payload?.pane_id || !payload.data) {
           return;
         }
-        terminalsRef.current.get(payload.pane_id)?.term.write(payload.data);
+        const sanitized = sanitizeTerminalProbeText(payload.data);
+        if (sanitized) {
+          const current = paneOutputProbeRef.current.get(payload.pane_id) ?? {
+            revision: 0,
+            text: ""
+          };
+          paneOutputProbeRef.current.set(payload.pane_id, {
+            revision: current.revision + 1,
+            text: appendTerminalProbeText(current.text, sanitized)
+          });
+        }
+        const runtime = terminalsRef.current.get(payload.pane_id);
+        if (runtime && !runtime.disposed) {
+          try {
+            runtime.term.write(payload.data);
+          } catch (error) {
+            console.error(error);
+          }
+        }
+        queuePanePreviewAutoRefreshRef.current(payload.pane_id);
+        queueSessionManageAutoRefreshRef.current(payload.pane_id);
       });
 
       unlistenExit = await listen<TerminalExitEvent>("terminal-exit", (event) => {
@@ -3221,7 +4139,13 @@ function App() {
           return;
         }
         const runtime = terminalsRef.current.get(payload.pane_id);
-        runtime?.term.writeln("\r\n[terminal exited]");
+        if (runtime && !runtime.disposed) {
+          try {
+            runtime.term.writeln("\r\n[terminal exited]");
+          } catch (error) {
+            console.error(error);
+          }
+        }
       });
     };
 
@@ -3243,6 +4167,37 @@ function App() {
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, [fitAllTerminals]);
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      const current = panePreviewResizeStateRef.current;
+      if (!current) {
+        return;
+      }
+      const nextHeight = clampInlinePreviewPanelHeight(
+        current.paneId,
+        current.originHeight - (event.clientY - current.startY)
+      );
+      updateSessionListPanelState(current.paneId, (panel) => ({
+        ...panel,
+        preview_panel_height: nextHeight
+      }));
+    };
+
+    const handleMouseUp = () => {
+      if (!panePreviewResizeStateRef.current) {
+        return;
+      }
+      panePreviewResizeStateRef.current = null;
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [clampInlinePreviewPanelHeight, updateSessionListPanelState]);
 
   useEffect(() => {
     const existingIds = new Set(panes.map((pane) => pane.id));
@@ -3366,8 +4321,10 @@ function App() {
 
   const openCreatePaneDialog = useCallback(() => {
     const provider = activePane?.provider || providers[0] || FALLBACK_PROVIDERS[0];
+    const teamDirectory = isTeamRoute ? workingDirectory : "";
+    const teamRoleCount = isTeamRoute ? createPaneDialog.team_role_count : 2;
     const nextState = {
-      ...createCreatePaneDialogState(provider, sessionParserProfiles),
+      ...createCreatePaneDialogState(provider, sessionParserProfiles, teamDirectory, teamRoleCount),
       open: true
     };
     setCreatePanePathTarget("rule_content_text_paths");
@@ -3389,7 +4346,15 @@ function App() {
         guard: (current) => current.open && current.provider_mode === "preset" && current.provider === parserId
       });
     }
-  }, [activePane?.provider, loadCreatePaneParserTemplate, providers, sessionParserProfiles]);
+  }, [
+    activePane?.provider,
+    createPaneDialog.team_role_count,
+    isTeamRoute,
+    loadCreatePaneParserTemplate,
+    providers,
+    sessionParserProfiles,
+    workingDirectory
+  ]);
 
   const addPane = useCallback(async () => {
     const provider =
@@ -3475,12 +4440,135 @@ function App() {
     warmupNativeSessionCache
   ]);
 
+  const changePaneDirectory = useCallback(async (paneId: string, targetPath: string) => {
+    const trimmed = targetPath.trim();
+    if (!trimmed) {
+      return;
+    }
+    const escaped = trimmed.replace(/"/g, '\\"');
+    await invoke<void>("write_to_pane", { paneId, data: `cd "${escaped}"\r` });
+  }, []);
+
+  const addTeam = useCallback(async () => {
+    const provider =
+      createPaneDialog.provider_mode === "preset"
+        ? createPaneDialog.provider
+        : createPaneDialog.custom_provider.trim().toLowerCase();
+    if (!provider) {
+      messageApi.warning("请填写自定义 Provider");
+      return;
+    }
+    const teamRoot = createPaneDialog.team_directory.trim();
+    if (!teamRoot) {
+      messageApi.warning("请选择团队目录");
+      return;
+    }
+    const roleCount = Math.max(1, Math.min(20, Math.round(createPaneDialog.team_role_count || 1)));
+    const sessionParsePreset = normalizeSessionParsePreset(createPaneDialog.session_parse_preset);
+    const sessionScanGlob = createPaneDialog.session_scan_glob.trim();
+    if (createPaneDialog.provider_mode === "custom" && !sessionScanGlob) {
+      messageApi.warning("自定义 Provider 必须填写扫描会话通配路径");
+      return;
+    }
+    const sessionParseJson = (createPaneDialog.session_parse_json.trim() || createPaneParserJsonPreview).trim();
+    setCreatePaneDialog((current) => ({ ...current, creating: true }));
+
+    let createdCount = 0;
+    let tempPanes = [...panes];
+    try {
+      const resolvedRoot = await invoke<string>("ensure_directory", { path: teamRoot });
+      const workPath = await invoke<string>("ensure_directory", {
+        path: joinFilesystemPath(resolvedRoot, TEAM_WORK_DIR_NAME)
+      });
+      const codePath = await invoke<string>("ensure_directory", {
+        path: joinFilesystemPath(resolvedRoot, TEAM_CODE_DIR_NAME)
+      });
+      const rolePaths: string[] = [];
+      for (let index = 1; index <= roleCount; index += 1) {
+        const rolePath = await invoke<string>("ensure_directory", {
+          path: joinFilesystemPath(workPath, `role-${index}`)
+        });
+        rolePaths.push(rolePath);
+      }
+
+      for (const targetPath of rolePaths) {
+        const autoTitle = buildAutoPaneTitle(provider, tempPanes);
+        const title = createPaneDialog.title_mode === "custom"
+          ? (createPaneDialog.custom_title.trim() || autoTitle)
+          : autoTitle;
+        const summary = await invoke<PaneSummary>("create_pane", {
+          provider,
+          title,
+          sessionParsePreset,
+          sessionScanGlob: sessionScanGlob || null,
+          sessionParseJson: sessionParseJson || null
+        });
+        createdCount += 1;
+        tempPanes = [...tempPanes, createPaneView(summary)];
+        setPanes((current) => {
+          const sharedProgressPane = current.find(
+            (pane) =>
+              pane.provider === summary.provider &&
+              (pane.scan_running || pane.scan_total_files > 0 || pane.scan_processed_files > 0)
+          );
+          const nextPane = {
+            ...createPaneView(summary),
+            scan_running: sharedProgressPane?.scan_running ?? false,
+            scan_total_files: sharedProgressPane?.scan_total_files ?? 0,
+            scan_processed_files: sharedProgressPane?.scan_processed_files ?? 0,
+            scan_changed_files: sharedProgressPane?.scan_changed_files ?? 0
+          };
+          return [...current, nextPane];
+        });
+        setActivePaneId(summary.id);
+        await invoke<boolean>("ensure_pane_runtime", { paneId: summary.id });
+        await changePaneDirectory(summary.id, targetPath);
+        void hydratePaneSessionState(summary.id);
+        void refreshScanProgress(summary.id);
+        void shouldWarmupNativeSessionCache(summary.id).then((shouldWarmup) => {
+          if (shouldWarmup) {
+            void warmupNativeSessionCache(summary.id, true);
+          }
+        });
+      }
+
+      setCreatePaneDialog(createCreatePaneDialogState(provider, sessionParserProfiles, resolvedRoot, roleCount));
+      setCreatePanePathTarget("rule_content_text_paths");
+      setCreatePaneSampleViewMode("root");
+      setCreatePaneSamplePreview({
+        loading: false,
+        error: "",
+        parser_profile: "",
+        file_path: "",
+        file_format: "",
+        sample_value: null,
+        message_sample_value: null
+      });
+      messageApi.success(`已创建团队（${createdCount}个终端）`);
+    } catch (error) {
+      console.error(error);
+      if (createdCount > 0) {
+        messageApi.warning(`已创建 ${createdCount} 个终端，剩余创建失败`);
+      } else {
+        messageApi.error("创建团队失败");
+      }
+      setCreatePaneDialog((current) => ({ ...current, creating: false }));
+    }
+  }, [
+    changePaneDirectory,
+    createPaneDialog,
+    createPaneParserJsonPreview,
+    hydratePaneSessionState,
+    messageApi,
+    panes,
+    refreshScanProgress,
+    sessionParserProfiles,
+    shouldWarmupNativeSessionCache,
+    warmupNativeSessionCache
+  ]);
+
   const closePane = useCallback(
     async (paneId: string) => {
-      if (panes.length <= 1) {
-        messageApi.warning("至少保留一个终端");
-        return;
-      }
       try {
         await invoke<void>("close_pane", { paneId });
         disposeTerminal(paneId);
@@ -3500,26 +4588,125 @@ function App() {
     [disposeTerminal, messageApi, panes]
   );
 
+  const readPaneSessionIdFromTerminal = useCallback(
+    async (paneId: string): Promise<string> => {
+      const normalizedPaneId = paneId.trim();
+      const pane = panes.find((item) => item.id === normalizedPaneId);
+      const runtime = terminalsRef.current.get(normalizedPaneId);
+      if (!normalizedPaneId || !pane || !runtime) {
+        return "";
+      }
+      const initialOutput = paneOutputProbeRef.current.get(normalizedPaneId) ?? {
+        revision: 0,
+        text: ""
+      };
+      const observedText = `${initialOutput.text}\n${readTerminalScreenText(runtime.term)}`;
+      const resolved = resolveSidProbeProfile(pane.provider, observedText);
+      if (!resolved) {
+        return "";
+      }
+
+      const token = (sidProbeTokenRef.current.get(normalizedPaneId) ?? 0) + 1;
+      sidProbeTokenRef.current.set(normalizedPaneId, token);
+      const probeProvider = resolved.provider;
+      const profile = resolved.profile;
+      const initialRevision = initialOutput.revision;
+      const initialTextLength = initialOutput.text.length;
+
+      let commandText = profile.command;
+      if (commandText.startsWith("/")) {
+        await invoke<void>("write_to_pane", { paneId: normalizedPaneId, data: "/" });
+        await new Promise<void>((resolve) =>
+          window.setTimeout(resolve, profile.slash_activation_delay_ms ?? profile.key_delay_ms ?? 36)
+        );
+
+        const slashDeadline = Date.now() + Math.max(1200, profile.poll_ms * 8);
+        while (Date.now() < slashDeadline) {
+          if ((sidProbeTokenRef.current.get(normalizedPaneId) ?? 0) !== token) {
+            return "";
+          }
+          const screenText = readTerminalScreenText(runtime.term);
+          if (isProviderSlashModeReady(screenText, probeProvider)) {
+            break;
+          }
+          await new Promise<void>((resolve) => window.setTimeout(resolve, profile.poll_ms));
+        }
+
+        commandText = commandText.slice(1);
+      }
+
+      for (const char of commandText) {
+        if ((sidProbeTokenRef.current.get(normalizedPaneId) ?? 0) !== token) {
+          return "";
+        }
+        await invoke<void>("write_to_pane", { paneId: normalizedPaneId, data: char });
+        await new Promise<void>((resolve) => window.setTimeout(resolve, profile.key_delay_ms ?? 18));
+      }
+
+      await new Promise<void>((resolve) => window.setTimeout(resolve, profile.submit_delay_ms ?? 80));
+      await invoke<void>("write_to_pane", { paneId: normalizedPaneId, data: "\r" });
+
+      const deadline = Date.now() + profile.timeout_ms;
+      while (Date.now() < deadline) {
+        if ((sidProbeTokenRef.current.get(normalizedPaneId) ?? 0) !== token) {
+          return "";
+        }
+        const outputState = paneOutputProbeRef.current.get(normalizedPaneId) ?? {
+          revision: 0,
+          text: ""
+        };
+        const candidateText =
+          outputState.revision > initialRevision && outputState.text.length >= initialTextLength
+            ? outputState.text.slice(initialTextLength)
+            : outputState.text;
+        const sid = extractSidFromTerminalProbeText(
+          `${candidateText}\n${readTerminalScreenText(runtime.term)}`,
+          probeProvider
+        );
+        if (sid) {
+          if (profile.cleanup_data) {
+            void invoke<void>("write_to_pane", { paneId: normalizedPaneId, data: profile.cleanup_data }).catch(
+              (error) => console.error(error)
+            );
+          }
+          return sid;
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, profile.poll_ms));
+      }
+
+      if (profile.cleanup_data) {
+        void invoke<void>("write_to_pane", { paneId: normalizedPaneId, data: profile.cleanup_data }).catch(
+          (error) => console.error(error)
+        );
+      }
+      return "";
+    },
+    [panes]
+  );
+
   const detectSid = useCallback(
     async (paneId: string) => {
-      updatePane(paneId, (pane) => ({ ...pane, sid_checking: true }));
+      const pane = panes.find((item) => item.id === paneId);
+      if (!pane || pane.sid_checking) {
+        return;
+      }
+      updatePane(paneId, (current) => ({ ...current, sid_checking: true }));
       try {
-        const suggested = await invoke<string | null>("suggest_native_session_id", { paneId });
+        const suggested = await readPaneSessionIdFromTerminal(paneId);
         if (suggested && suggested.trim()) {
-          const pane = panes.find((item) => item.id === paneId);
           await setPaneSessionState(paneId, suggested.trim(), pane?.linked_session_ids ?? []);
-          messageApi.success(`识别到 SID: ${shortSessionId(suggested)}`);
+          messageApi.success(`已读取状态信息并绑定 SID: ${shortSessionId(suggested)}`);
         } else {
-          messageApi.info("未识别到 SID");
+          messageApi.info("未从状态信息中读取到 Session ID");
         }
       } catch (error) {
         console.error(error);
-        messageApi.error("SID 检测失败");
+        messageApi.error("读取状态信息绑定 SID 失败");
       } finally {
         updatePane(paneId, (pane) => ({ ...pane, sid_checking: false }));
       }
     },
-    [messageApi, panes, setPaneSessionState, updatePane]
+    [messageApi, panes, readPaneSessionIdFromTerminal, setPaneSessionState, updatePane]
   );
 
   const closeSyncDialog = useCallback(() => {
@@ -3880,38 +5067,6 @@ function App() {
     });
   }, [syncDialogCurrentSessionId, syncDialogFilteredEntries]);
 
-  const copySyncDialogMessages = useCallback(async () => {
-    const paneId = syncDialog.pane_id;
-    if (!paneId) {
-      return;
-    }
-    const loadedEntries = await ensureSyncDialogSessionsLoaded(
-      paneId,
-      syncDialog.selected_session_ids,
-      true
-    );
-    const selectedPreviewEntries = collectSyncDialogSelectedEntries(loadedEntries);
-
-    if (!selectedPreviewEntries.length) {
-      messageApi.info("暂无可复制消息");
-      return;
-    }
-
-    const payload = await buildSyncDialogPlainPayload(selectedPreviewEntries);
-
-    try {
-      await copyTextToClipboard(payload);
-      messageApi.success(`已复制 ${selectedPreviewEntries.length} 条消息到剪贴板`);
-    } catch (error) {
-      console.error(error);
-      messageApi.error("复制消息失败");
-    }
-  }, [
-    messageApi,
-    syncDialog.pane_id,
-    syncDialog.selected_session_ids
-  ]);
-
   const mapNativePreviewRowsToEntries = useCallback(
     (paneId: string, sessionId: string, rows: NativeSessionPreviewRow[]): EntryRecord[] =>
       rows.map((row, index) => ({
@@ -4009,6 +5164,63 @@ function App() {
       return [...syncDialogEntryCacheRef.current.values()].flat().sort(compareEntryByTime);
     },
     [ensureSyncDialogSessionLoaded, syncDialog.entries, syncDialog.included_entry_ids, syncDialogCurrentSessionId]
+  );
+
+  const hydrateSyncDialogEntriesWithFullContent = useCallback(
+    async (paneId: string, entries: EntryRecord[]): Promise<EntryRecord[]> => {
+      if (!paneId || !entries.length) {
+        return entries;
+      }
+
+      const selectionMap = new Map<string, NativeSessionMessageSelection>();
+      entries.forEach((entry) => {
+        const sessionId = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+        if (!sessionId || sessionId === SYNC_UNKNOWN_SESSION_ID) {
+          return;
+        }
+        const cacheKey = `${sessionId}::${entry.id}`;
+        if (!selectionMap.has(cacheKey)) {
+          selectionMap.set(cacheKey, {
+            messageId: entry.id,
+            sessionId
+          });
+        }
+      });
+
+      if (!selectionMap.size) {
+        return entries;
+      }
+
+      const details = await invoke<NativeSessionMessageDetailResponse[]>(
+        "get_native_session_message_details",
+        {
+          paneId,
+          messages: [...selectionMap.values()]
+        }
+      );
+      const detailMap = new Map(
+        details.map((detail) => [`${detail.session_id}::${detail.message_id}`, detail] as const)
+      );
+
+      return entries.map((entry) => {
+        const sessionId = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
+        if (!sessionId || sessionId === SYNC_UNKNOWN_SESSION_ID) {
+          return entry;
+        }
+        const detail = detailMap.get(`${sessionId}::${entry.id}`);
+        if (!detail) {
+          return entry;
+        }
+        return {
+          ...entry,
+          kind: detail.kind || entry.kind,
+          content: typeof detail.content === "string" ? detail.content : entry.content,
+          created_at: detail.created_at > 0 ? detail.created_at : entry.created_at,
+          preview_truncated: false
+        };
+      });
+    },
+    [syncDialogCurrentSessionId]
   );
 
   const buildSyncDialogPlainPayload = useCallback(
@@ -4427,7 +5639,11 @@ function App() {
       messageApi.warning("当前预览无可同步内容");
       return;
     }
-    const payload = await buildSyncDialogPlainPayload(selectedPreviewEntries);
+    const selectedEntries = await hydrateSyncDialogEntriesWithFullContent(
+      paneId,
+      selectedPreviewEntries
+    );
+    const payload = await buildSyncDialogPlainPayload(selectedEntries);
     if (!payload.trim()) {
       messageApi.warning("当前选中消息为空");
       return;
@@ -4458,7 +5674,7 @@ function App() {
         progress_text: syncProgressText("done")
       }));
       messageApi.success(
-        `同步完成：${selectedPreviewEntries.length} 条记录 -> ${
+        `同步完成：${selectedEntries.length} 条记录 -> ${
           panes.find((item) => item.id === targetPaneId)?.title || "目标窗格"
         }`
       );
@@ -4474,6 +5690,10 @@ function App() {
       messageApi.error("同步失败");
     }
   }, [
+    buildSyncDialogPlainPayload,
+    collectSyncDialogSelectedEntries,
+    ensureSyncDialogSessionsLoaded,
+    hydrateSyncDialogEntriesWithFullContent,
     messageApi,
     panes,
     syncDialog.open,
@@ -4512,27 +5732,31 @@ function App() {
   }, [messageApi, sendDialog.input, sendDialog.pane_id]);
 
   const openSessionManageDialog = useCallback(
-    (paneId: string) => {
+    (paneId: string, viewMode: SessionManageDialogState["view_mode"] = "manage") => {
       const pane = panes.find((item) => item.id === paneId);
       if (!pane) {
         return;
       }
       const panel = getSessionListPanelState(pane.id);
+      const previewSessionId = viewMode === "list" ? pane.active_session_id.trim() : panel.preview_session_id;
       setSessionManageDialog({
         open: true,
         pane_id: pane.id,
         active_session_id: pane.active_session_id,
         linked_session_ids: [...pane.linked_session_ids],
-        saving: false
+        saving: false,
+        view_mode: viewMode
       });
       setSessionManagePreview({
-        preview_session_id: panel.preview_session_id,
+        preview_session_id: previewSessionId,
         preview_loading: false,
-        preview_rows: [...panel.preview_rows],
-        preview_total_rows: panel.preview_total_rows,
-        preview_loaded_rows: panel.preview_loaded_rows,
-        preview_has_more: panel.preview_has_more
+        preview_rows: viewMode === "list" ? [] : [...panel.preview_rows],
+        preview_total_rows: viewMode === "list" ? 0 : panel.preview_total_rows,
+        preview_loaded_rows: viewMode === "list" ? 0 : panel.preview_loaded_rows,
+        preview_has_more: viewMode === "list" ? false : panel.preview_has_more,
+        preview_from_end: viewMode === "list" ? true : panel.preview_from_end
       });
+      setSessionManagePreviewScrollCommand(null);
       setSessionManageGroupTab("current");
       setSessionManageScanConfig(null);
       void invoke<PaneScanConfig>("get_pane_scan_config", { paneId: pane.id })
@@ -4570,7 +5794,11 @@ function App() {
         ...current,
         open: keepPanelClosed ? current.open : true,
         preview_session_id: sid,
-        preview_loading: true
+        preview_loading: true,
+        preview_rows: current.preview_session_id === sid ? current.preview_rows : [],
+        preview_total_rows: current.preview_session_id === sid ? current.preview_total_rows : 0,
+        preview_loaded_rows: current.preview_session_id === sid ? current.preview_loaded_rows : 0,
+        preview_has_more: current.preview_session_id === sid ? current.preview_has_more : false
       }));
       try {
         const response = await invoke<NativeSessionPreviewResponse>("preview_native_session_messages", {
@@ -4593,19 +5821,23 @@ function App() {
             return current;
           }
           const incomingRows = response.rows || [];
+          const canMergeCurrentRows = current.preview_session_id === sid;
           const nextRows =
-            mergeMode === "prepend" && current.preview_session_id === sid
-              ? [...incomingRows, ...current.preview_rows]
-              : mergeMode === "append" && current.preview_session_id === sid
-                ? [...current.preview_rows, ...incomingRows]
-                : incomingRows;
+            mergeMode === "prepend" && canMergeCurrentRows
+              ? mergeNativePreviewRows(incomingRows, current.preview_rows)
+              : mergeMode === "append" && canMergeCurrentRows
+                ? mergeNativePreviewRows(current.preview_rows, incomingRows)
+                : mergeMode === "replace" && canMergeCurrentRows && fromEnd
+                  ? mergeNativePreviewRows(current.preview_rows, incomingRows)
+                  : incomingRows;
+          const totalRows = Number(response.total_rows || 0);
           return {
             ...current,
             preview_loading: false,
             preview_rows: nextRows,
-            preview_total_rows: Number(response.total_rows || 0),
+            preview_total_rows: totalRows,
             preview_loaded_rows: nextRows.length,
-            preview_has_more: Boolean(response.has_more),
+            preview_has_more: nextRows.length < totalRows,
             preview_from_end: fromEnd
           };
         });
@@ -4844,6 +6076,8 @@ function App() {
     ]
   );
 
+  reloadSessionListDialogRef.current = reloadSessionListDialog;
+
   const reindexNativeSessions = useCallback(
     async (paneId: string) => {
       const normalizedPaneId = paneId.trim();
@@ -4993,37 +6227,80 @@ function App() {
     [updateSessionListPanelState]
   );
 
+  const toggleSessionPreviewAutoRefresh = useCallback(
+    (paneId: string) => {
+      updateSessionListPanelState(paneId, (current) => ({
+        ...current,
+        preview_auto_refresh: !current.preview_auto_refresh
+      }));
+    },
+    [updateSessionListPanelState]
+  );
+
   const loadSessionManagePreview = useCallback(
-    async (paneId: string, sessionId: string, loadAll = false) => {
+    async (
+      paneId: string,
+      sessionId: string,
+      loadAll = false,
+      options?: {
+        fromEnd?: boolean;
+        offset?: number;
+        mergeMode?: "replace" | "prepend" | "append";
+      }
+    ) => {
       const sid = sessionId.trim();
       if (!paneId || !sid) {
         return;
       }
       const ticket = sessionManagePreviewTicketRef.current + 1;
       sessionManagePreviewTicketRef.current = ticket;
+      const fromEnd = options?.fromEnd ?? !loadAll;
+      const offset = options?.offset ?? 0;
+      const mergeMode = options?.mergeMode ?? "replace";
       setSessionManagePreview((current) => ({
         ...current,
         preview_session_id: sid,
-        preview_loading: true
+        preview_loading: true,
+        preview_rows: current.preview_session_id === sid ? current.preview_rows : [],
+        preview_total_rows: current.preview_session_id === sid ? current.preview_total_rows : 0,
+        preview_loaded_rows: current.preview_session_id === sid ? current.preview_loaded_rows : 0,
+        preview_has_more: current.preview_session_id === sid ? current.preview_has_more : false,
+        preview_from_end: current.preview_session_id === sid ? current.preview_from_end : fromEnd
       }));
       try {
         const response = await invoke<NativeSessionPreviewResponse>("preview_native_session_messages", {
           paneId,
           sessionId: sid,
           limit: 200,
+          offset,
           loadAll,
-          fromEnd: !loadAll
+          fromEnd
         });
         if (sessionManagePreviewTicketRef.current !== ticket) {
           return;
         }
-        setSessionManagePreview({
-          preview_session_id: sid,
-          preview_loading: false,
-          preview_rows: response.rows || [],
-          preview_total_rows: Number(response.total_rows || 0),
-          preview_loaded_rows: Number(response.loaded_rows || 0),
-          preview_has_more: Boolean(response.has_more)
+        setSessionManagePreview((current) => {
+          const incomingRows = response.rows || [];
+          const sameSession = current.preview_session_id === sid;
+          const sameDirection = current.preview_from_end === fromEnd;
+          const nextRows =
+            mergeMode === "prepend" && sameSession
+              ? mergeNativePreviewRows(incomingRows, current.preview_rows)
+              : mergeMode === "append" && sameSession
+                ? mergeNativePreviewRows(current.preview_rows, incomingRows)
+                : mergeMode === "replace" && sameSession && sameDirection && fromEnd
+                  ? mergeNativePreviewRows(current.preview_rows, incomingRows)
+                  : incomingRows;
+          const totalRows = Number(response.total_rows || 0);
+          return {
+            preview_session_id: sid,
+            preview_loading: false,
+            preview_rows: nextRows,
+            preview_total_rows: totalRows,
+            preview_loaded_rows: nextRows.length,
+            preview_has_more: nextRows.length < totalRows,
+            preview_from_end: fromEnd
+          };
         });
       } catch (error) {
         if (sessionManagePreviewTicketRef.current !== ticket) {
@@ -5045,6 +6322,591 @@ function App() {
     }
     await loadSessionManagePreview(paneId, sid, true);
   }, [loadSessionManagePreview, sessionManagePaneId, sessionManagePreview.preview_loading, sessionManagePreview.preview_session_id]);
+
+  const loadMoreSessionManagePreviewRows = useCallback(async () => {
+    const paneId = sessionManagePaneId;
+    const sid = sessionManagePreview.preview_session_id.trim();
+    if (!paneId || !sid || sessionManagePreview.preview_loading || !sessionManagePreview.preview_has_more) {
+      return;
+    }
+    await loadSessionManagePreview(paneId, sid, false, {
+      fromEnd: sessionManagePreview.preview_from_end,
+      offset: sessionManagePreview.preview_loaded_rows,
+      mergeMode: sessionManagePreview.preview_from_end ? "prepend" : "append"
+    });
+  }, [
+    loadSessionManagePreview,
+    sessionManagePaneId,
+    sessionManagePreview.preview_from_end,
+    sessionManagePreview.preview_has_more,
+    sessionManagePreview.preview_loading,
+    sessionManagePreview.preview_loaded_rows,
+    sessionManagePreview.preview_session_id
+  ]);
+
+  const jumpSessionManagePreviewToStart = useCallback(async () => {
+    const paneId = sessionManagePaneId;
+    const sid = sessionManagePreview.preview_session_id.trim();
+    if (!paneId || !sid) {
+      setSessionManagePreviewScrollCommand((current) => ({
+        target: "top",
+        nonce: (current?.nonce || 0) + 1
+      }));
+      return;
+    }
+    await loadSessionManagePreview(paneId, sid, false, {
+      fromEnd: false,
+      offset: 0,
+      mergeMode: "replace"
+    });
+    setSessionManagePreviewScrollCommand((current) => ({
+      target: "top",
+      nonce: (current?.nonce || 0) + 1
+    }));
+  }, [loadSessionManagePreview, sessionManagePaneId, sessionManagePreview.preview_session_id]);
+
+  const jumpSessionManagePreviewToLatest = useCallback(async () => {
+    const paneId = sessionManagePaneId;
+    const sid = sessionManagePreview.preview_session_id.trim();
+    if (!paneId || !sid) {
+      setSessionManagePreviewScrollCommand((current) => ({
+        target: "bottom",
+        nonce: (current?.nonce || 0) + 1
+      }));
+      return;
+    }
+    await loadSessionManagePreview(paneId, sid, false, {
+      fromEnd: true,
+      offset: 0,
+      mergeMode: "replace"
+    });
+    setSessionManagePreviewScrollCommand((current) => ({
+      target: "bottom",
+      nonce: (current?.nonce || 0) + 1
+    }));
+  }, [loadSessionManagePreview, sessionManagePaneId, sessionManagePreview.preview_session_id]);
+
+  const refreshSessionManageLiveView = useCallback(
+    async (paneId: string, previewSessionId?: string, loadAll = false) => {
+      const normalizedPaneId = paneId.trim();
+      if (!normalizedPaneId) {
+        return;
+      }
+      await refreshNativeSessionCache(normalizedPaneId);
+      if (!sessionManageIsListView) {
+        await reloadSessionListDialog(normalizedPaneId, undefined, {
+          fullLoad: true,
+          keepPanelClosed: true
+        });
+      }
+      const sid = (previewSessionId ?? sessionManagePreview.preview_session_id).trim();
+      if (sid) {
+        await loadSessionManagePreview(
+          normalizedPaneId,
+          sid,
+          loadAll,
+          loadAll
+            ? undefined
+            : {
+                fromEnd: sessionManagePreview.preview_from_end
+              }
+        );
+      }
+    },
+    [
+      loadSessionManagePreview,
+      refreshNativeSessionCache,
+      reloadSessionListDialog,
+      sessionManageIsListView,
+      sessionManagePreview.preview_from_end,
+      sessionManagePreview.preview_session_id
+    ]
+  );
+
+  const refreshStandaloneSessionPreview = useCallback(
+    async (paneId: string, silent = false) => {
+      const normalizedPaneId = paneId.trim();
+      if (!normalizedPaneId) {
+        return;
+      }
+      try {
+        await refreshNativeSessionCache(normalizedPaneId);
+        const paneState = await invoke<PaneSessionState>("get_pane_session_state", {
+          paneId: normalizedPaneId
+        });
+        updatePane(normalizedPaneId, (pane) => ({
+          ...pane,
+          active_session_id: paneState.active_session_id || "",
+          linked_session_ids: Array.isArray(paneState.linked_session_ids) ? paneState.linked_session_ids : []
+        }));
+        const activeSessionId = (paneState.active_session_id || "").trim();
+        if (activeSessionId) {
+          await loadSessionManagePreview(normalizedPaneId, activeSessionId, true);
+        } else {
+          setSessionManagePreview(createSessionManagePreviewState());
+          setSessionManagePreviewScrollCommand(null);
+        }
+      } catch (error) {
+        console.error(error);
+        if (!silent) {
+          messageApi.error("刷新当前会话预览失败");
+        }
+      }
+    },
+    [loadSessionManagePreview, messageApi, refreshNativeSessionCache, updatePane]
+  );
+
+  const resolveStandaloneSessionPreviewHostWindow = useCallback(async () => {
+    return (await WebviewWindow.getByLabel("main")) ?? getCurrentWindow();
+  }, []);
+
+  const readWindowLogicalOuterSize = useCallback(
+    async (windowRef: {
+      outerSize: () => Promise<{ width: number; height: number }>;
+      scaleFactor: () => Promise<number>;
+    }) => {
+      const [size, scaleFactor] = await Promise.all([
+        windowRef.outerSize(),
+        windowRef.scaleFactor()
+      ]);
+      return {
+        width: Math.max(1, Math.round(size.width / scaleFactor)),
+        height: Math.max(1, Math.round(size.height / scaleFactor))
+      };
+    },
+    []
+  );
+
+  const copySyncDialogMessages = useCallback(async () => {
+    const paneId = syncDialog.pane_id;
+    if (!paneId) {
+      return;
+    }
+    const loadedEntries = await ensureSyncDialogSessionsLoaded(
+      paneId,
+      syncDialog.selected_session_ids,
+      true
+    );
+    const selectedPreviewEntries = collectSyncDialogSelectedEntries(loadedEntries);
+
+    if (!selectedPreviewEntries.length) {
+      messageApi.info("暂无可复制消息");
+      return;
+    }
+
+    const selectedEntries = await hydrateSyncDialogEntriesWithFullContent(
+      paneId,
+      selectedPreviewEntries
+    );
+    const payload = await buildSyncDialogPlainPayload(selectedEntries);
+
+    try {
+      await copyTextToClipboard(payload);
+      messageApi.success(`已复制 ${selectedEntries.length} 条消息到剪贴板`);
+    } catch (error) {
+      console.error(error);
+      messageApi.error("复制消息失败");
+    }
+  }, [
+    buildSyncDialogPlainPayload,
+    collectSyncDialogSelectedEntries,
+    ensureSyncDialogSessionsLoaded,
+    hydrateSyncDialogEntriesWithFullContent,
+    messageApi,
+    syncDialog.pane_id,
+    syncDialog.selected_session_ids
+  ]);
+
+  const resolveStandaloneSessionPreviewInitialPosition = useCallback(
+    async (
+      popupWidth = STANDALONE_SESSION_PREVIEW_DEFAULT_WIDTH,
+      popupHeight = STANDALONE_SESSION_PREVIEW_DEFAULT_HEIGHT
+    ) => {
+      const mainWindow = await resolveStandaloneSessionPreviewHostWindow();
+      const [mainPos, mainSize, scaleFactor] = await Promise.all([
+        mainWindow.outerPosition(),
+        mainWindow.outerSize(),
+        mainWindow.scaleFactor()
+      ]);
+      const physical = resolveRightCenteredWindowPhysicalPosition({
+        hostX: mainPos.x,
+        hostY: mainPos.y,
+        hostWidth: mainSize.width,
+        hostHeight: mainSize.height,
+        popupWidth: Math.round(popupWidth * scaleFactor),
+        popupHeight: Math.round(popupHeight * scaleFactor)
+      });
+      return {
+        x: Math.round(physical.x / scaleFactor),
+        y: Math.round(physical.y / scaleFactor)
+      };
+    },
+    [resolveStandaloneSessionPreviewHostWindow]
+  );
+
+  const alignStandaloneSessionPreviewWindow = useCallback(
+    async (
+      previewWindow: WebviewWindow,
+      fallbackWidth = STANDALONE_SESSION_PREVIEW_DEFAULT_WIDTH,
+      fallbackHeight = STANDALONE_SESSION_PREVIEW_DEFAULT_HEIGHT
+    ) => {
+      if (await previewWindow.isMaximized().catch(() => false)) {
+        return;
+      }
+      const mainWindow = await resolveStandaloneSessionPreviewHostWindow();
+      const [mainPos, mainSize, scaleFactor] = await Promise.all([
+        mainWindow.outerPosition(),
+        mainWindow.outerSize(),
+        mainWindow.scaleFactor()
+      ]);
+
+      let popupWidth = Math.round(fallbackWidth * scaleFactor);
+      let popupHeight = Math.round(fallbackHeight * scaleFactor);
+
+      try {
+        const popupSize = await previewWindow.outerSize();
+        if (popupSize.width > 0 && popupSize.height > 0) {
+          popupWidth = popupSize.width;
+          popupHeight = popupSize.height;
+        }
+      } catch {}
+
+      const physical = resolveRightCenteredWindowPhysicalPosition({
+        hostX: mainPos.x,
+        hostY: mainPos.y,
+        hostWidth: mainSize.width,
+        hostHeight: mainSize.height,
+        popupWidth,
+        popupHeight
+      });
+
+      await previewWindow.setPosition(new PhysicalPosition(physical.x, physical.y));
+    },
+    [resolveStandaloneSessionPreviewHostWindow]
+  );
+
+  const toggleStandaloneSessionPreviewCompactMode = useCallback(async () => {
+    const previewWindow = getCurrentWebviewWindow();
+    try {
+      if (standaloneSessionPreviewCompactMode) {
+        const restoreSize = standaloneSessionPreviewRestoreSizeRef.current ?? {
+          width: STANDALONE_SESSION_PREVIEW_DEFAULT_WIDTH,
+          height: STANDALONE_SESSION_PREVIEW_DEFAULT_HEIGHT
+        };
+        await previewWindow.setSize(new LogicalSize(restoreSize.width, restoreSize.height));
+        await alignStandaloneSessionPreviewWindow(
+          previewWindow,
+          restoreSize.width,
+          restoreSize.height
+        );
+        setStandaloneSessionPreviewCompactMode(false);
+        return;
+      }
+
+      standaloneSessionPreviewRestoreSizeRef.current = await readWindowLogicalOuterSize(previewWindow);
+      const hostWindow = await resolveStandaloneSessionPreviewHostWindow();
+      const hostSize = await readWindowLogicalOuterSize(hostWindow);
+      const compactSize = resolveStandaloneSessionPreviewCompactLogicalSize(
+        hostSize.width,
+        hostSize.height
+      );
+
+      await previewWindow.setSize(new LogicalSize(compactSize.width, compactSize.height));
+      await alignStandaloneSessionPreviewWindow(
+        previewWindow,
+        compactSize.width,
+        compactSize.height
+      );
+      setStandaloneSessionPreviewCompactMode(true);
+    } catch (error) {
+      console.error(error);
+      messageApi.error(standaloneSessionPreviewCompactMode ? "恢复窗口失败" : "最小化窗口失败");
+    }
+  }, [
+    alignStandaloneSessionPreviewWindow,
+    messageApi,
+    readWindowLogicalOuterSize,
+    resolveStandaloneSessionPreviewHostWindow,
+    standaloneSessionPreviewCompactMode
+  ]);
+
+  const openStandaloneSessionPreviewWindow = useCallback(
+    async (paneId: string) => {
+      const normalizedPaneId = paneId.trim();
+      if (!normalizedPaneId) {
+        return;
+      }
+      const pane = panes.find((item) => item.id === normalizedPaneId);
+      if (!pane) {
+        return;
+      }
+      if (!pane.active_session_id.trim()) {
+        messageApi.warning("当前窗格未绑定 SID");
+        return;
+      }
+      const windowTitle = `${asTitle(pane.provider)} 当前会话预览`;
+      try {
+        const existingWindow = await WebviewWindow.getByLabel(STANDALONE_SESSION_PREVIEW_WINDOW_LABEL);
+        if (existingWindow) {
+          await existingWindow.setTitle(windowTitle).catch((error) => console.error(error));
+          await emitTo(STANDALONE_SESSION_PREVIEW_WINDOW_LABEL, STANDALONE_SESSION_PREVIEW_SET_PANE_EVENT, {
+            paneId: normalizedPaneId
+          });
+          await alignStandaloneSessionPreviewWindow(existingWindow).catch((error) => console.error(error));
+          await existingWindow.show().catch((error) => console.error(error));
+          await existingWindow.setFocus().catch((error) => console.error(error));
+          return;
+        }
+        const initialPosition = await resolveStandaloneSessionPreviewInitialPosition();
+        const previewWindow = new WebviewWindow(STANDALONE_SESSION_PREVIEW_WINDOW_LABEL, {
+          url: buildStandaloneSessionPreviewUrl(normalizedPaneId),
+          title: windowTitle,
+          width: STANDALONE_SESSION_PREVIEW_DEFAULT_WIDTH,
+          height: STANDALONE_SESSION_PREVIEW_DEFAULT_HEIGHT,
+          minWidth: STANDALONE_SESSION_PREVIEW_MIN_WIDTH,
+          minHeight: STANDALONE_SESSION_PREVIEW_MIN_HEIGHT,
+          x: initialPosition.x,
+          y: initialPosition.y,
+          alwaysOnTop: readStandaloneSessionPreviewAlwaysOnTopPreference(),
+          resizable: true,
+          focus: true
+        });
+        previewWindow.once("tauri://created", () => {
+          void alignStandaloneSessionPreviewWindow(previewWindow).catch((error) => console.error(error));
+        });
+        previewWindow.once("tauri://error", (event) => {
+          console.error(event);
+          messageApi.error("打开独立预览窗口失败");
+        });
+      } catch (error) {
+        console.error(error);
+        messageApi.error("打开独立预览窗口失败");
+      }
+    },
+    [alignStandaloneSessionPreviewWindow, messageApi, panes, resolveStandaloneSessionPreviewInitialPosition]
+  );
+
+  useEffect(() => {
+    if (!isStandaloneSessionPreviewRoute) {
+      return;
+    }
+    let unlistenFn: (() => void) | null = null;
+    getCurrentWebviewWindow()
+      .listen<StandaloneSessionPreviewTargetPayload>(
+        STANDALONE_SESSION_PREVIEW_SET_PANE_EVENT,
+        (event) => {
+          const nextPaneId = String(event.payload?.paneId || "").trim();
+          setStandaloneSessionPreviewPaneId(nextPaneId);
+        }
+      )
+      .then((fn) => {
+        unlistenFn = fn;
+      })
+      .catch((error) => console.error(error));
+    return () => {
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
+  }, [isStandaloneSessionPreviewRoute]);
+
+  useEffect(() => {
+    if (!isStandaloneSessionPreviewRoute) {
+      return;
+    }
+    let cancelled = false;
+    getCurrentWindow()
+      .isAlwaysOnTop()
+      .then((value) => {
+        if (cancelled) {
+          return;
+        }
+        setStandaloneSessionPreviewAlwaysOnTop(value);
+        writeStandaloneSessionPreviewAlwaysOnTopPreference(value);
+      })
+      .catch((error) => console.error(error));
+    return () => {
+      cancelled = true;
+    };
+  }, [isStandaloneSessionPreviewRoute]);
+
+  useEffect(() => {
+    if (isStandaloneSessionPreviewRoute) {
+      return;
+    }
+
+    const currentWindow = getCurrentWindow();
+    let resizeUnlisten: (() => void) | null = null;
+    let moveUnlisten: (() => void) | null = null;
+    let syncRafId: number | null = null;
+
+    const syncPreviewPosition = () => {
+      if (syncRafId !== null) {
+        window.cancelAnimationFrame(syncRafId);
+      }
+      syncRafId = window.requestAnimationFrame(() => {
+        syncRafId = null;
+        void WebviewWindow.getByLabel(STANDALONE_SESSION_PREVIEW_WINDOW_LABEL)
+          .then((previewWindow) => {
+            if (!previewWindow) {
+              return;
+            }
+            return alignStandaloneSessionPreviewWindow(previewWindow);
+          })
+          .catch((error) => console.error(error));
+      });
+    };
+
+    currentWindow.onResized(syncPreviewPosition).then((fn) => {
+      resizeUnlisten = fn;
+    }).catch((error) => console.error(error));
+
+    currentWindow.onMoved(syncPreviewPosition).then((fn) => {
+      moveUnlisten = fn;
+    }).catch((error) => console.error(error));
+
+    return () => {
+      if (syncRafId !== null) {
+        window.cancelAnimationFrame(syncRafId);
+      }
+      resizeUnlisten?.();
+      moveUnlisten?.();
+    };
+  }, [alignStandaloneSessionPreviewWindow, isStandaloneSessionPreviewRoute]);
+
+  useEffect(() => {
+    if (!isStandaloneSessionPreviewRoute) {
+      return;
+    }
+
+    const currentWindow = getCurrentWindow();
+    let resizeUnlisten: (() => void) | null = null;
+    let syncRafId: number | null = null;
+
+    const syncToRight = () => {
+      if (syncRafId !== null) {
+        window.cancelAnimationFrame(syncRafId);
+      }
+      syncRafId = window.requestAnimationFrame(() => {
+        syncRafId = null;
+        void alignStandaloneSessionPreviewWindow(getCurrentWebviewWindow()).catch((error) =>
+          console.error(error)
+        );
+      });
+    };
+
+    currentWindow.onResized(syncToRight).then((fn) => {
+      resizeUnlisten = fn;
+    }).catch((error) => console.error(error));
+
+    return () => {
+      if (syncRafId !== null) {
+        window.cancelAnimationFrame(syncRafId);
+      }
+      resizeUnlisten?.();
+    };
+  }, [alignStandaloneSessionPreviewWindow, isStandaloneSessionPreviewRoute]);
+
+  useEffect(() => {
+    if (!isStandaloneSessionPreviewRoute) {
+      return;
+    }
+    const nextUrl = buildStandaloneSessionPreviewUrl(standaloneSessionPreviewPaneId);
+    const currentUrl = `${normalizeAppPathname(window.location.pathname)}${window.location.search || ""}`;
+    if (currentUrl === nextUrl) {
+      return;
+    }
+    try {
+      window.history.replaceState({}, "", nextUrl);
+    } catch (error) {
+      console.error(error);
+    }
+  }, [isStandaloneSessionPreviewRoute, standaloneSessionPreviewPaneId]);
+
+  useEffect(() => {
+    if (!isStandaloneSessionPreviewRoute || loading) {
+      return;
+    }
+    if (!standaloneSessionPreviewPane) {
+      setSessionManagePreview(createSessionManagePreviewState());
+      setSessionManagePreviewScrollCommand(null);
+      return;
+    }
+    const activeSessionId = standaloneSessionPreviewPane.active_session_id.trim();
+    if (!activeSessionId) {
+      setSessionManagePreview(createSessionManagePreviewState());
+      setSessionManagePreviewScrollCommand(null);
+      return;
+    }
+    void loadSessionManagePreview(standaloneSessionPreviewPane.id, activeSessionId, true);
+  }, [
+    isStandaloneSessionPreviewRoute,
+    loadSessionManagePreview,
+    loading,
+    standaloneSessionPreviewPane
+  ]);
+
+  useEffect(() => {
+    if (!isStandaloneSessionPreviewRoute || !standaloneSessionPreviewPane) {
+      return;
+    }
+    if (!standaloneSessionPreviewListState?.preview_auto_refresh) {
+      return;
+    }
+    const paneId = standaloneSessionPreviewPane.id;
+    const timer = window.setInterval(() => {
+      if (standaloneSessionPreviewAutoRefreshRunningRef.current) {
+        return;
+      }
+      standaloneSessionPreviewAutoRefreshRunningRef.current = true;
+      void refreshStandaloneSessionPreview(paneId, true)
+        .catch((error) => console.error(error))
+        .finally(() => {
+          standaloneSessionPreviewAutoRefreshRunningRef.current = false;
+        });
+    }, 1000);
+    return () => {
+      window.clearInterval(timer);
+      standaloneSessionPreviewAutoRefreshRunningRef.current = false;
+    };
+  }, [
+    isStandaloneSessionPreviewRoute,
+    refreshStandaloneSessionPreview,
+    standaloneSessionPreviewListState?.preview_auto_refresh,
+    standaloneSessionPreviewPane
+  ]);
+
+  useEffect(() => {
+    if (!isStandaloneSessionPreviewRoute) {
+      return;
+    }
+    const title = standaloneSessionPreviewPane
+      ? `${asTitle(standaloneSessionPreviewPane.provider)} 当前会话预览`
+      : "当前会话预览";
+    void getCurrentWebviewWindow().setTitle(title).catch((error) => console.error(error));
+  }, [isStandaloneSessionPreviewRoute, standaloneSessionPreviewPane]);
+
+  const toggleStandaloneSessionPreviewAlwaysOnTop = useCallback(async () => {
+    const nextValue = !standaloneSessionPreviewAlwaysOnTop;
+    try {
+      await getCurrentWindow().setAlwaysOnTop(nextValue);
+      setStandaloneSessionPreviewAlwaysOnTop(nextValue);
+      writeStandaloneSessionPreviewAlwaysOnTopPreference(nextValue);
+    } catch (error) {
+      console.error(error);
+      messageApi.error(nextValue ? "开启窗口置顶失败" : "取消窗口置顶失败");
+    }
+  }, [messageApi, standaloneSessionPreviewAlwaysOnTop]);
+
+  useEffect(() => {
+    if (previewOverlaySource === "session-manage" && !sessionManageDialog.open) {
+      setPreviewOverlaySource(null);
+      return;
+    }
+    if (previewOverlaySource === "sync-dialog" && !syncDialog.open) {
+      setPreviewOverlaySource(null);
+    }
+  }, [previewOverlaySource, sessionManageDialog.open, syncDialog.open]);
 
   const loadNativePreviewMessageDetail = useCallback(
     async (
@@ -5074,6 +6936,32 @@ function App() {
       };
     },
     []
+  );
+  const loadSessionManagePreviewMessageDetail = useCallback(
+    (item: SyncEntryPreviewItem) =>
+      loadNativePreviewMessageDetail(
+        sessionManagePaneId,
+        sessionManagePreview.preview_session_id,
+        item
+      ),
+    [
+      loadNativePreviewMessageDetail,
+      sessionManagePaneId,
+      sessionManagePreview.preview_session_id
+    ]
+  );
+  const loadSyncDialogPreviewMessageDetail = useCallback(
+    (item: SyncEntryPreviewItem) =>
+      loadNativePreviewMessageDetail(
+        syncDialog.pane_id,
+        resolveSyncDialogPreviewItemSessionId(item),
+        item
+      ),
+    [
+      loadNativePreviewMessageDetail,
+      resolveSyncDialogPreviewItemSessionId,
+      syncDialog.pane_id
+    ]
   );
 
   const toggleSessionListSortField = useCallback(
@@ -5105,6 +6993,13 @@ function App() {
         return;
       }
       updateSessionListPanelState(paneId, (current) => ({ ...current, open: true }));
+      if (isCompactViewport) {
+        await reloadSessionListDialog(paneId, undefined, { fullLoad: true });
+        if (activeSessionId) {
+          await loadSessionListPreview(paneId, activeSessionId, false, { fromEnd: true });
+        }
+        return;
+      }
       const shouldReload =
         !panel.items.length ||
         panel.loading ||
@@ -5136,6 +7031,7 @@ function App() {
       loadSessionListPreview,
       nextSessionListLoadTicket,
       nextSessionPreviewLoadTicket,
+      isCompactViewport,
       panes,
       reloadSessionListDialog,
       updateSessionListPanelState
@@ -5440,36 +7336,43 @@ function App() {
         void loadSessionListPreview(pane.id, activeSessionId, false);
       }
     }
-  }, [getSessionListPanelState, loadSessionListPreview, panes]);
+  }, [getSessionListPanelState, loadSessionListPreview, panes, sessionListPanels]);
 
   useEffect(() => {
-    const activePreviewTargets = panes
-      .map((pane) => ({
-        pane_id: pane.id,
-        active_session_id: pane.active_session_id.trim(),
-        panel: getSessionListPanelState(pane.id)
-      }))
-      .filter(
-        (item) =>
-          item.panel.open &&
-          item.active_session_id &&
-          !item.panel.preview_loading &&
-          item.panel.preview_session_id.trim() === item.active_session_id &&
-          (sessionPreviewFollowBottomRef.current.get(item.pane_id) ?? true)
-      );
-
-    if (!activePreviewTargets.length) {
-      return undefined;
-    }
-
-    const timer = window.setInterval(() => {
-      for (const item of activePreviewTargets) {
-        void loadSessionListPreview(item.pane_id, item.active_session_id, false);
+    for (const pane of panes) {
+      const panel = getSessionListPanelState(pane.id);
+      const activeSessionId = pane.active_session_id.trim();
+      if (
+        !panel.open ||
+        !activeSessionId ||
+        panel.preview_loading ||
+        !panel.preview_has_more ||
+        !panel.preview_from_end ||
+        panel.preview_session_id.trim() !== activeSessionId ||
+        !(sessionPreviewFollowBottomRef.current.get(pane.id) ?? true)
+      ) {
+        continue;
       }
-    }, 4000);
+      void loadSessionListPreview(pane.id, activeSessionId, false, {
+        fromEnd: true,
+        offset: panel.preview_loaded_rows,
+        mergeMode: "prepend"
+      });
+    }
+  }, [getSessionListPanelState, loadSessionListPreview, panes, sessionListPanels]);
 
-    return () => window.clearInterval(timer);
-  }, [getSessionListPanelState, loadSessionListPreview, panes]);
+  useEffect(() => {
+    return () => {
+      for (const timer of panePreviewAutoRefreshTimerRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      panePreviewAutoRefreshTimerRef.current.clear();
+      if (sessionManageAutoRefreshTimerRef.current !== null) {
+        window.clearTimeout(sessionManageAutoRefreshTimerRef.current);
+        sessionManageAutoRefreshTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const loadMoreSessionListDialog = useCallback(
     async (paneId: string) => {
@@ -5555,6 +7458,89 @@ function App() {
     },
     [getSessionListPanelState, loadSessionListPreview]
   );
+
+  const queuePanePreviewAutoRefresh = useCallback(
+    (paneId: string) => {
+      if (panePreviewAutoRefreshTimerRef.current.has(paneId)) {
+        return;
+      }
+      const timer = window.setTimeout(() => {
+        panePreviewAutoRefreshTimerRef.current.delete(paneId);
+        if (panePreviewAutoRefreshRunningRef.current.has(paneId)) {
+          return;
+        }
+        const pane = panes.find((item) => item.id === paneId);
+        const activeSessionId = pane?.active_session_id.trim() ?? "";
+        const panel = getSessionListPanelState(paneId);
+        if (
+          !pane ||
+          !panel.open ||
+          !panel.preview_auto_refresh ||
+          !activeSessionId ||
+          panel.preview_loading ||
+          panel.preview_session_id.trim() !== activeSessionId
+        ) {
+          return;
+        }
+        panePreviewAutoRefreshRunningRef.current.add(paneId);
+        void loadSessionListPreview(paneId, activeSessionId, false)
+          .catch((error) => console.error(error))
+          .finally(() => {
+            panePreviewAutoRefreshRunningRef.current.delete(paneId);
+          });
+      }, 500);
+      panePreviewAutoRefreshTimerRef.current.set(paneId, timer);
+    },
+    [getSessionListPanelState, loadSessionListPreview, panes]
+  );
+
+  const queueSessionManageAutoRefresh = useCallback(
+    (paneId: string) => {
+      if (sessionManageAutoRefreshTimerRef.current !== null) {
+        return;
+      }
+      const timer = window.setTimeout(() => {
+        sessionManageAutoRefreshTimerRef.current = null;
+        if (sessionManageAutoRefreshRunningRef.current) {
+          return;
+        }
+        if (
+          !sessionManageDialog.open ||
+          paneId !== sessionManagePaneId ||
+          !sessionManageListState?.preview_auto_refresh
+        ) {
+          return;
+        }
+        sessionManageAutoRefreshRunningRef.current = true;
+        void refreshSessionManageLiveView(
+          paneId,
+          sessionManagePreview.preview_session_id,
+          sessionManageIsListView
+        )
+          .catch((error) => console.error(error))
+          .finally(() => {
+            sessionManageAutoRefreshRunningRef.current = false;
+          });
+      }, 500);
+      sessionManageAutoRefreshTimerRef.current = timer;
+    },
+    [
+      refreshSessionManageLiveView,
+      sessionManageDialog.open,
+      sessionManageIsListView,
+      sessionManageListState?.preview_auto_refresh,
+      sessionManagePaneId,
+      sessionManagePreview.preview_session_id
+    ]
+  );
+
+  useEffect(() => {
+    queuePanePreviewAutoRefreshRef.current = queuePanePreviewAutoRefresh;
+  }, [queuePanePreviewAutoRefresh]);
+
+  useEffect(() => {
+    queueSessionManageAutoRefreshRef.current = queueSessionManageAutoRefresh;
+  }, [queueSessionManageAutoRefresh]);
 
   const openAllSessionPanels = useCallback(async () => {
     for (const pane of panes) {
@@ -5812,32 +7798,221 @@ function App() {
     }
   }, [applyingWorkdir, messageApi, workingDirectory]);
 
+  const pickTeamDirectory = useCallback(async () => {
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: createPaneDialog.team_directory.trim() || workingDirectory.trim() || undefined,
+        title: "选择团队目录"
+      });
+      if (typeof selected === "string") {
+        setCreatePaneDialog((current) => ({ ...current, team_directory: selected.trim() }));
+      }
+    } catch (error) {
+      console.error(error);
+      messageApi.error("打开目录选择器失败");
+    }
+  }, [createPaneDialog.team_directory, messageApi, workingDirectory]);
+
+  if (isStandaloneSessionPreviewRoute) {
+    const activeSessionId = standaloneSessionPreviewPane?.active_session_id.trim() ?? "";
+    const previewAvailable = Boolean(standaloneSessionPreviewPane && activeSessionId);
+    return (
+      <ConfigProvider theme={antdThemeConfig}>
+        {contextHolder}
+        <Layout className="app-shell">
+          <Layout.Content className="app-content standalone-session-preview-content">
+            <div className="standalone-session-preview-page">
+              <div className="session-list-right standalone-session-preview-shell">
+                <Card size="small" title="当前会话预览" className="standalone-session-preview-card">
+                  <div className="standalone-session-preview-body">
+                    {loading ? (
+                      <div className="session-preview-loading">
+                        <Spin size="large" />
+                      </div>
+                    ) : !standaloneSessionPreviewPane ? (
+                      <Typography.Text type="secondary">目标窗格不存在或已关闭</Typography.Text>
+                    ) : (
+                      <>
+                        <Space size={8} wrap className="standalone-session-preview-meta">
+                          <Tag>{asTitle(standaloneSessionPreviewPane.provider)}</Tag>
+                          <Tag>{standaloneSessionPreviewPane.title || standaloneSessionPreviewPane.id}</Tag>
+                          <Tag color={activeSessionId ? "cyan" : "default"}>
+                            SID: {activeSessionId ? shortSessionId(activeSessionId) : "未绑定"}
+                          </Tag>
+                        </Space>
+
+                        <div className="session-preview-head">
+                          <Typography.Text type="secondary">
+                            SID：{sessionManagePreview.preview_session_id ? shortSessionId(sessionManagePreview.preview_session_id) : "-"}
+                          </Typography.Text>
+                          <Space size={6}>
+                            <Button
+                              size="small"
+                              icon={<CompressOutlined />}
+                              onClick={() => void toggleStandaloneSessionPreviewCompactMode()}
+                            >
+                              {standaloneSessionPreviewCompactMode ? "恢复" : "最小化"}
+                            </Button>
+                            <Button
+                              size="small"
+                              type={standaloneSessionPreviewAlwaysOnTop ? "primary" : "default"}
+                              icon={<PushpinOutlined />}
+                              onClick={() => void toggleStandaloneSessionPreviewAlwaysOnTop()}
+                            >
+                              {standaloneSessionPreviewAlwaysOnTop ? "已置顶" : "置顶"}
+                            </Button>
+                            <Button
+                              size="small"
+                              icon={<SyncOutlined />}
+                              onClick={() => void refreshStandaloneSessionPreview(standaloneSessionPreviewPane.id)}
+                              loading={sessionManagePreview.preview_loading}
+                              disabled={!standaloneSessionPreviewPane}
+                            >
+                              刷新
+                            </Button>
+                            <Button
+                              size="small"
+                              type={standaloneSessionPreviewListState?.preview_auto_refresh ? "primary" : "default"}
+                              icon={<SyncOutlined spin={Boolean(standaloneSessionPreviewListState?.preview_auto_refresh)} />}
+                              onClick={() => toggleSessionPreviewAutoRefresh(standaloneSessionPreviewPane.id)}
+                              disabled={!previewAvailable}
+                            >
+                              {standaloneSessionPreviewListState?.preview_auto_refresh ? "自动刷新中" : "自动刷新"}
+                            </Button>
+                            <Typography.Text type="secondary">
+                              已加载 {sessionManagePreview.preview_loaded_rows}/{sessionManagePreview.preview_total_rows}
+                            </Typography.Text>
+                          </Space>
+                        </div>
+
+                        <div className="session-preview-scroll">
+                          {sessionManagePreview.preview_loading && !sessionManagePreview.preview_rows.length ? (
+                            <div className="session-preview-loading">
+                              <Spin />
+                            </div>
+                          ) : previewAvailable ? (
+                            <SyncEntryPreviewList
+                              show_checkbox={false}
+                              user_avatar_src={userAvatarSrc}
+                              assistant_avatar_src={assistantAvatarSrc}
+                              auto_follow_bottom
+                              items={sessionManagePreview.preview_rows.map((row, index) => ({
+                                id: row.id || `${row.created_at}-${index}-${row.kind}`,
+                                kind: row.kind,
+                                content: row.content,
+                                created_at_text: formatTs(row.created_at),
+                                sid_text: sessionManagePreview.preview_session_id
+                                  ? shortSessionId(sessionManagePreview.preview_session_id)
+                                  : "-",
+                                included: true,
+                                preview_truncated: Boolean(row.preview_truncated)
+                              }))}
+                              empty_text="当前会话暂无预览消息"
+                              on_request_full_content={(item) =>
+                                loadNativePreviewMessageDetail(
+                                  standaloneSessionPreviewPane.id,
+                                  sessionManagePreview.preview_session_id,
+                                  item
+                                )
+                              }
+                            />
+                          ) : (
+                            <Typography.Text type="secondary">当前窗格尚未绑定 SID，暂无可预览消息</Typography.Text>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </Card>
+              </div>
+            </div>
+          </Layout.Content>
+        </Layout>
+      </ConfigProvider>
+    );
+  }
+
   return (
     <ConfigProvider theme={antdThemeConfig}>
       {contextHolder}
       <Layout className="app-shell">
         <Layout.Header className="topbar" style={headerStyle}>
           <div className="topbar-left">
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => openCreatePaneDialog()}>
-              新建终端
-            </Button>
-            <Segmented
-              value={layoutMode}
-              onChange={(value) => setLayoutMode(value === "horizontal" ? "horizontal" : "vertical")}
-              options={[
-                { value: "vertical", label: "竖屏" },
-                { value: "horizontal", label: "横屏" }
-              ]}
-            />
+            {isWorkspaceLikeRoute ? (
+              <>
+                <Button type="primary" icon={<PlusOutlined />} onClick={() => openCreatePaneDialog()}>
+                  {isTeamRoute ? "新建团队" : "新建终端"}
+                </Button>
+                <Segmented
+                  value={layoutMode}
+                  onChange={(value) => setLayoutMode(value === "horizontal" ? "horizontal" : "vertical")}
+                  options={[
+                    { value: "vertical", label: "竖屏" },
+                    { value: "horizontal", label: "横屏" }
+                  ]}
+                />
+              </>
+            ) : (
+              (aiTeamHeaderActions?.left ?? []).map((action) => (
+                <Button
+                  key={action.key}
+                  type={action.primary ? "primary" : "default"}
+                  danger={action.danger}
+                  loading={action.loading}
+                  disabled={action.disabled}
+                  onClick={action.onClick}
+                >
+                  {action.label}
+                </Button>
+              ))
+            )}
           </div>
           <div className="topbar-right">
-            <Button type="primary" onClick={() => void openAllSessionPanels()}>
-              全部展开会话
-            </Button>
-            <Button onClick={() => closeAllSessionPanels()}>全部收起会话</Button>
-            <Button icon={<SettingOutlined />} onClick={() => setConfigOpen(true)}>
-              配置
-            </Button>
+            {isWorkspaceLikeRoute ? (
+              <>
+                <Button
+                  danger
+                  loading={clearingAllSid}
+                  disabled={!panesWithSessionBindings.length}
+                  onClick={() => void clearAllPaneSessionBindings()}
+                >
+                  清空全部SID
+                </Button>
+                <Button onClick={() => navigateTo(isTeamRoute ? "workspace" : "team")}>
+                  {isTeamRoute ? "回到终端页" : "团队工作台"}
+                </Button>
+                <Button type="primary" onClick={() => void openAllSessionPanels()}>
+                  全部展开会话
+                </Button>
+                <Button onClick={() => closeAllSessionPanels()}>全部收起会话</Button>
+                <Button icon={<SettingOutlined />} onClick={() => setConfigOpen(true)}>
+                  配置
+                </Button>
+              </>
+            ) : (
+              <>
+                {(aiTeamHeaderActions?.right ?? []).map((action) => (
+                  <Button
+                    key={action.key}
+                    type={action.primary ? "primary" : "default"}
+                    danger={action.danger}
+                    loading={action.loading}
+                    disabled={action.disabled}
+                    onClick={action.onClick}
+                  >
+                    {action.label}
+                  </Button>
+                ))}
+                <Button icon={<SettingOutlined />} onClick={() => setConfigOpen(true)}>
+                  通用配置
+                </Button>
+                <Button onClick={() => navigateTo("workspace")}>
+                  终端工作台
+                </Button>
+              </>
+            )}
           </div>
         </Layout.Header>
 
@@ -5846,9 +8021,10 @@ function App() {
             <div className="loading-wrap">
               <Spin size="large" tip="正在加载终端..." />
             </div>
-          ) : (
-            <main className="pane-grid" style={gridStyle}>
-              {panes.map((pane) => {
+          ) : isWorkspaceLikeRoute ? (
+            <div className="workspace-content-shell">
+              <main className="pane-grid" style={gridStyle}>
+                {panes.map((pane) => {
                 const sessionListDialog =
                   sessionListPanels[pane.id] ?? { ...createSessionListDialogState(), pane_id: pane.id };
                 const statusDensityClass =
@@ -5881,100 +8057,142 @@ function App() {
                   }
                   onMouseDown={() => setActivePaneId(pane.id)}
                 >
-                  <div className="pane-terminal">
-                    <div className="terminal-mount" ref={getTerminalMountRef(pane.id)} />
-                  </div>
+                  <div className="pane-split-layout" ref={getPaneSplitContainerRef(pane.id)}>
+                    <div className="pane-top-section">
+                      <div className="pane-terminal">
+                        <div className="terminal-mount" ref={getTerminalMountRef(pane.id)} />
+                      </div>
 
-                  <div className={`pane-statusbar ${statusDensityClass}`}>
-                    <div className="status-info">
-                      <Tooltip
-                        title={pane.active_session_id ? "打开会话管理" : "点击检测 SID"}
-                      >
-                        <Tag
-                          color={pane.active_session_id ? "cyan" : "default"}
-                          className="status-click-tag"
-                          onClick={() =>
-                            pane.active_session_id
-                              ? openSessionManageDialog(pane.id)
-                              : void detectSid(pane.id)
-                          }
-                        >
-                        SID: {pane.active_session_id ? shortSessionId(pane.active_session_id) : "未检测"}
-                        </Tag>
-                      </Tooltip>
-                      <Tooltip title="打开会话管理">
-                        <Tag
-                          color={pane.linked_session_ids.length > 0 ? "blue" : "default"}
-                          className="status-click-tag"
-                          onClick={() => openSessionManageDialog(pane.id)}
-                        >
-                          关联: {pane.linked_session_ids.length}
-                        </Tag>
-                      </Tooltip>
-                      <Tag color={pane.scan_running ? "processing" : "default"}>
-                        缓存构建: {pane.scan_processed_files}/{pane.scan_total_files}
-                      </Tag>
-                      <Tag>变更: {pane.scan_changed_files}</Tag>
+                      <div className={`pane-statusbar ${statusDensityClass}`}>
+                        <div className="status-info">
+                          <Tooltip
+                            title={
+                              pane.active_session_id
+                                ? "打开会话管理"
+                                : pane.sid_checking
+                                  ? "正在读取状态信息"
+                                  : "点击读取状态信息绑定 SID"
+                            }
+                          >
+                            <Tag
+                              color={pane.active_session_id ? "cyan" : "default"}
+                              className={`status-click-tag ${pane.sid_checking ? "is-disabled" : ""}`}
+                              onClick={() =>
+                                pane.active_session_id
+                                  ? openSessionManageDialog(pane.id)
+                                  : pane.sid_checking
+                                    ? undefined
+                                    : void detectSid(pane.id)
+                              }
+                            >
+                            SID: {
+                              pane.active_session_id
+                                ? shortSessionId(pane.active_session_id)
+                                : pane.sid_checking
+                                  ? "检测中..."
+                                  : "未检测"
+                            }
+                            </Tag>
+                          </Tooltip>
+                          <Tooltip title="打开会话管理">
+                            <Tag
+                              color={pane.linked_session_ids.length > 0 ? "blue" : "default"}
+                              className="status-click-tag"
+                              onClick={() => openSessionManageDialog(pane.id)}
+                            >
+                              关联: {pane.linked_session_ids.length}
+                            </Tag>
+                          </Tooltip>
+                          <Tag color={pane.scan_running ? "processing" : "default"}>
+                            缓存构建: {pane.scan_processed_files}/{pane.scan_total_files}
+                          </Tag>
+                          <Tag>变更: {pane.scan_changed_files}</Tag>
+                        </div>
+                        <div className="status-cache-progress">
+                          <Progress
+                            percent={
+                              pane.scan_total_files > 0
+                                ? Math.min(
+                                    100,
+                                    Math.round((Math.max(0, pane.scan_processed_files) / pane.scan_total_files) * 100)
+                                  )
+                                : 0
+                            }
+                            size="small"
+                            showInfo={false}
+                            status={
+                              pane.scan_running
+                                ? "active"
+                                : pane.scan_total_files > 0 && pane.scan_processed_files >= pane.scan_total_files
+                                  ? "success"
+                                  : "normal"
+                            }
+                          />
+                          <Typography.Text type="secondary" className="status-cache-progress-text">
+                            {pane.scan_running
+                              ? `文件缓存构建 ${pane.scan_processed_files}/${pane.scan_total_files || "?"}`
+                              : pane.scan_total_files > 0
+                                ? `文件缓存就绪 ${pane.scan_processed_files}/${pane.scan_total_files}`
+                                : "文件缓存待构建"}
+                          </Typography.Text>
+                        </div>
+                        <div className="status-actions">
+                          <Tooltip title="同步">
+                            <Button
+                              size="small"
+                              className="status-action-btn status-btn-sync"
+                              icon={<SyncOutlined />}
+                              type={panes.length >= 2 ? "primary" : "default"}
+                              disabled={panes.length < 2}
+                              onClick={() => void openSyncDialog(pane.id)}
+                            >
+                              <span className="status-btn-label-full">同步</span>
+                              <span className="status-btn-label-short">同</span>
+                            </Button>
+                          </Tooltip>
+                          <Tooltip title="会话列表">
+                            <Button
+                              size="small"
+                              className="status-action-btn status-btn-session-list"
+                              icon={<SearchOutlined />}
+                              type={sessionListDialog.open ? "primary" : "default"}
+                              onClick={() => void openSessionListDialog(pane.id)}
+                            >
+                              <span className="status-btn-label-full">会话列表</span>
+                              <span className="status-btn-label-short">列</span>
+                            </Button>
+                          </Tooltip>
+                          <Tooltip title="当前会话预览窗口">
+                            <Button
+                              size="small"
+                              className="status-action-btn status-btn-session-list"
+                              icon={<SearchOutlined />}
+                              onClick={() => void openStandaloneSessionPreviewWindow(pane.id)}
+                            >
+                              <span className="status-btn-label-full">当前会话窗</span>
+                              <span className="status-btn-label-short">窗</span>
+                            </Button>
+                          </Tooltip>
+                        </div>
+                      </div>
                     </div>
-                    <div className="status-cache-progress">
-                      <Progress
-                        percent={
-                          pane.scan_total_files > 0
-                            ? Math.min(
-                                100,
-                                Math.round((Math.max(0, pane.scan_processed_files) / pane.scan_total_files) * 100)
-                              )
-                            : 0
-                        }
-                        size="small"
-                        showInfo={false}
-                        status={
-                          pane.scan_running
-                            ? "active"
-                            : pane.scan_total_files > 0 && pane.scan_processed_files >= pane.scan_total_files
-                              ? "success"
-                              : "normal"
-                        }
-                      />
-                      <Typography.Text type="secondary" className="status-cache-progress-text">
-                        {pane.scan_running
-                          ? `文件缓存构建 ${pane.scan_processed_files}/${pane.scan_total_files || "?"}`
-                          : pane.scan_total_files > 0
-                            ? `文件缓存就绪 ${pane.scan_processed_files}/${pane.scan_total_files}`
-                            : "文件缓存待构建"}
-                      </Typography.Text>
-                    </div>
-                    <div className="status-actions">
-                      <Tooltip title="同步">
-                        <Button
-                          size="small"
-                          className="status-action-btn status-btn-sync"
-                          icon={<SyncOutlined />}
-                          type={panes.length >= 2 ? "primary" : "default"}
-                          disabled={panes.length < 2}
-                          onClick={() => void openSyncDialog(pane.id)}
-                        >
-                          <span className="status-btn-label-full">同步</span>
-                          <span className="status-btn-label-short">同</span>
-                        </Button>
-                      </Tooltip>
-                      <Tooltip title="会话列表">
-                        <Button
-                          size="small"
-                          className="status-action-btn status-btn-session-list"
-                          icon={<SearchOutlined />}
-                          type={sessionListDialog.open ? "primary" : "default"}
-                          onClick={() => void openSessionListDialog(pane.id)}
-                        >
-                          <span className="status-btn-label-full">会话列表</span>
-                          <span className="status-btn-label-short">列</span>
-                        </Button>
-                      </Tooltip>
-                    </div>
-                  </div>
 
                   {sessionListDialog.open ? (
-                    <div className="session-inline-panel session-inline-preview-only">
+                    <>
+                    <div
+                      className="pane-preview-splitter"
+                      onMouseDown={(event) => startPanePreviewResize(pane.id, event)}
+                    >
+                      <div className="pane-preview-splitter-grip" />
+                    </div>
+                    <div
+                      className="session-inline-panel session-inline-preview-only pane-resizable-preview"
+                      style={{
+                        flexBasis: `${sessionListDialog.preview_panel_height}px`,
+                        minHeight: `${sessionListDialog.preview_panel_height}px`,
+                        maxHeight: `${sessionListDialog.preview_panel_height}px`
+                      }}
+                    >
                       <Card size="small" title="会话预览" className="session-inline-preview-card">
                         {(() => {
                           const inlinePreviewSessionId = pane.active_session_id.trim();
@@ -6000,6 +8218,15 @@ function App() {
                             {inlinePreviewSessionId ? shortSessionId(inlinePreviewSessionId) : "-"}
                           </Typography.Text>
                           <Space size={6}>
+                            <Button
+                              size="small"
+                              type={sessionListDialog.preview_auto_refresh ? "primary" : "default"}
+                              icon={<SyncOutlined spin={sessionListDialog.preview_auto_refresh} />}
+                              onClick={() => toggleSessionPreviewAutoRefresh(pane.id)}
+                              disabled={!inlinePreviewSessionId}
+                            >
+                              {sessionListDialog.preview_auto_refresh ? "自动刷新中" : "自动刷新"}
+                            </Button>
                             <Typography.Text type="secondary">
                               已加载 {inlinePreviewLoadedRows}/{inlinePreviewTotalRows}
                             </Typography.Text>
@@ -6059,11 +8286,26 @@ function App() {
                         })()}
                       </Card>
                     </div>
+                    </>
                   ) : null}
+                  </div>
                   </Card>
-                );
-              })}
-            </main>
+                  );
+                })}
+              </main>
+            </div>
+          ) : (
+            <AiTeamMcpPage
+              providers={providers}
+              defaultProjectDirectory={workingDirectory}
+              onOpenCommonSettings={() => setConfigOpen(true)}
+              onSyncPaneSessionState={hydratePaneSessionState}
+              onProbePaneSessionId={readPaneSessionIdFromTerminal}
+              onHeaderActionsChange={setAiTeamHeaderActions}
+              onClose={() => {
+                navigateTo("workspace");
+              }}
+            />
           )}
         </Layout.Content>
       </Layout>
@@ -6303,16 +8545,60 @@ function App() {
             message_sample_value: null
           });
           setCreatePaneDialog(
-            createCreatePaneDialogState(activePane?.provider || providers[0] || "codex", sessionParserProfiles)
+            createCreatePaneDialogState(
+              activePane?.provider || providers[0] || "codex",
+              sessionParserProfiles,
+              isTeamRoute ? workingDirectory : "",
+              createPaneDialog.team_role_count
+            )
           );
         }}
-        onOk={() => void addPane()}
-        okText="创建"
+        onOk={() => void (isTeamRoute ? addTeam() : addPane())}
+        okText={isTeamRoute ? "创建团队" : "创建"}
         cancelText="取消"
         confirmLoading={createPaneDialog.creating}
-        title="新建终端"
+        title={isTeamRoute ? "新建团队" : "新建终端"}
       >
         <Form layout="vertical">
+          {isTeamRoute ? (
+            <>
+              <Form.Item
+                label="团队目录"
+                required
+                extra={`将自动创建 ${TEAM_WORK_DIR_NAME} 与 ${TEAM_CODE_DIR_NAME} 两个子目录（终端仅创建在 ${TEAM_WORK_DIR_NAME}/role-*）`}
+              >
+                <Space.Compact style={{ width: "100%" }}>
+                  <Input
+                    value={createPaneDialog.team_directory}
+                    onChange={(event) =>
+                      setCreatePaneDialog((current) => ({ ...current, team_directory: event.target.value }))
+                    }
+                    placeholder="选择或输入团队目录"
+                  />
+                  <Button icon={<FolderOpenOutlined />} onClick={() => void pickTeamDirectory()}>
+                    选择目录
+                  </Button>
+                </Space.Compact>
+              </Form.Item>
+              <Form.Item
+                label="角色数量"
+                extra={`将在 ${TEAM_WORK_DIR_NAME} 下创建 role-1 至 role-N 子目录，并为每个子目录生成终端`}
+              >
+                <InputNumber
+                  min={1}
+                  max={20}
+                  value={createPaneDialog.team_role_count}
+                  onChange={(value) =>
+                    setCreatePaneDialog((current) => ({
+                      ...current,
+                      team_role_count: Math.max(1, Math.min(20, Math.round(Number(value || 1))))
+                    }))
+                  }
+                  style={{ width: "100%" }}
+                />
+              </Form.Item>
+            </>
+          ) : null}
           <Form.Item label="Provider 来源">
             <Segmented
               value={createPaneDialog.provider_mode}
@@ -6961,12 +9247,13 @@ function App() {
           setSessionManageDialog(createSessionManageDialogState());
           setSessionManageGroupTab("current");
           setSessionManagePreview(createSessionManagePreviewState());
+          setSessionManagePreviewScrollCommand(null);
           setSessionManageScanConfig(null);
           setUnrecognizedFilePreviewDialog(createUnrecognizedFilePreviewDialogState());
           setUnrecognizedFilesModal(createUnrecognizedFilesModalState());
         }}
         className="session-manage-modal"
-        style={{ top: 20 }}
+        centered
         styles={{
           body: {
             maxHeight: "72vh",
@@ -6974,8 +9261,8 @@ function App() {
             overflowX: "hidden"
           }
         }}
-        title="会话管理"
-        width={1180}
+        title={sessionManageIsListView ? "当前会话预览" : "会话管理"}
+        width={isCompactViewport ? "96vw" : 1180}
         footer={
           <Space>
             <Button
@@ -6983,6 +9270,7 @@ function App() {
                 setSessionManageDialog(createSessionManageDialogState());
                 setSessionManageGroupTab("current");
                 setSessionManagePreview(createSessionManagePreviewState());
+                setSessionManagePreviewScrollCommand(null);
                 setSessionManageScanConfig(null);
                 setUnrecognizedFilePreviewDialog(createUnrecognizedFilePreviewDialogState());
                 setUnrecognizedFilesModal(createUnrecognizedFilesModalState());
@@ -6995,7 +9283,8 @@ function App() {
       >
         {sessionManagePane && sessionManageListState ? (
           <>
-            <Card size="small" className="session-manage-meta-card">
+            {!sessionManageIsListView ? (
+              <Card size="small" className="session-manage-meta-card">
               <Space size={10} wrap style={{ width: "100%", justifyContent: "space-between" }}>
                 <Space size={8} wrap>
                   <Tag color={sessionManagePane.active_session_id ? "cyan" : "default"}>
@@ -7004,11 +9293,17 @@ function App() {
                       ? shortSessionId(sessionManagePane.active_session_id)
                       : "未检测"}
                   </Tag>
+                  {sessionManageMissingCurrentIndexed ? (
+                    <Tag color="orange">当前 SID 未入索引</Tag>
+                  ) : null}
                   <Tooltip
                     title={`已配置关联 SID: ${sessionManagePane.linked_session_ids.length}`}
                   >
                     <Tag>关联会话: {sessionManageGroupedItems.linked.length}</Tag>
                   </Tooltip>
+                  {sessionManageMissingLinkedCount > 0 ? (
+                    <Tag color="orange">未入索引关联: {sessionManageMissingLinkedCount}</Tag>
+                  ) : null}
                   <Tag
                     color={
                       sessionManageProgressState.mode === "scan"
@@ -7040,34 +9335,40 @@ function App() {
                     </Tooltip>
                   ) : null}
                 </Space>
-                <Space size={8} wrap>
-                  <Button
-                    loading={sessionManagePane.sid_checking}
-                    onClick={() => {
-                      void detectSid(sessionManagePaneId).then(() =>
-                        void reloadSessionListDialog(sessionManagePaneId, undefined, {
-                          fullLoad: true,
-                          keepPanelClosed: true
-                        })
-                      );
-                    }}
-                  >
-                    Rebind SID
-                  </Button>
-                  <Button
-                    onClick={() => void reindexNativeSessions(sessionManagePaneId)}
-                    loading={sessionManageReindexing || sessionManagePane.scan_running}
-                    disabled={!sessionManagePaneId || sessionManageReindexing}
-                  >
-                    Rebuild Index
-                  </Button>
-                  <Button
-                    onClick={() => void openUnrecognizedFilesModal()}
-                    disabled={sessionManageFileStats.displayUnrecognized <= 0}
-                  >
-                    异常文件 ({sessionManageFileStats.displayUnrecognized})
-                  </Button>
-                </Space>
+                {!sessionManageIsListView ? (
+                  <Space size={8} wrap>
+                    <Button
+                      type={sessionManageListState.preview_auto_refresh ? "primary" : "default"}
+                      icon={<SyncOutlined spin={sessionManageListState.preview_auto_refresh} />}
+                      onClick={() => toggleSessionPreviewAutoRefresh(sessionManagePaneId)}
+                      disabled={!sessionManagePaneId}
+                    >
+                      {sessionManageListState.preview_auto_refresh ? "自动刷新中" : "自动刷新"}
+                    </Button>
+                    <Button
+                      loading={sessionManagePane.sid_checking}
+                      disabled={!sessionManagePaneId || sessionManagePane.sid_checking}
+                      onClick={() => {
+                        void detectSid(sessionManagePaneId);
+                      }}
+                    >
+                      读取状态信息绑定 SID
+                    </Button>
+                    <Button
+                      onClick={() => void reindexNativeSessions(sessionManagePaneId)}
+                      loading={sessionManageReindexing || sessionManagePane.scan_running}
+                      disabled={!sessionManagePaneId || sessionManageReindexing}
+                    >
+                      Rebuild Index
+                    </Button>
+                    <Button
+                      onClick={() => void openUnrecognizedFilesModal()}
+                      disabled={sessionManageFileStats.displayUnrecognized <= 0}
+                    >
+                      异常文件 ({sessionManageFileStats.displayUnrecognized})
+                    </Button>
+                  </Space>
+                ) : null}
               </Space>
               <Progress
                 percent={sessionManageProgressState.percent}
@@ -7076,9 +9377,11 @@ function App() {
                 format={() => sessionManageProgressInlineText}
                 style={{ marginTop: 10 }}
               />
-            </Card>
+              </Card>
+            ) : null}
 
-            <div className="session-list-toolbar">
+            {!sessionManageIsListView ? (
+              <div className="session-list-toolbar">
               <Card size="small" className="session-sort-toolbar">
                 <div className="session-sort-toolbar-inner">
                   <Space size={8} className="session-sort-buttons" wrap>
@@ -7245,9 +9548,11 @@ function App() {
                   <Button onClick={() => void resetSessionListFilters(sessionManagePaneId)}>清空筛选</Button>
                 </div>
               </Card>
-            </div>
+              </div>
+            ) : null}
 
-            <div className="session-list-progress">
+            {!sessionManageIsListView ? (
+              <div className="session-list-progress">
               <Typography.Text type="secondary">
                 已加载 {sessionManageListState.items.length}/{sessionManageListState.total}
               </Typography.Text>
@@ -7255,26 +9560,34 @@ function App() {
                 当前 {sessionManageGroupedItems.current.length} | 关联 {sessionManageGroupedItems.linked.length} | 未关联{" "}
                 {sessionManageGroupedItems.unlinked.length}
               </Typography.Text>
-            </div>
+              {sessionManageMissingCurrentIndexed || sessionManageMissingLinkedCount > 0 ? (
+                <Typography.Text type="warning">
+                  已绑定但未入索引的 SID 会额外显示在对应分组中，不计入会话总数。
+                </Typography.Text>
+              ) : null}
+              </div>
+            ) : null}
 
             <div className="session-list-layout">
-              <div className="session-list-left">
-                <Tabs
-                  size="small"
-                  activeKey={sessionManageGroupTab}
-                  onChange={(key) => setSessionManageGroupTab(key as SessionManageGroupTabKey)}
-                  className="session-manage-group-tabs"
-                  items={[
-                    {
-                      key: "current",
-                      label: `当前 (${sessionManageGroupedItems.current.length})`,
-                      children: (
-                        <div className="session-manage-tab-pane">
-                          {sessionManageGroupedItems.current.length ? (
-                            <div className="session-inline-group-list">
-                              {sessionManageGroupedItems.current.map((item) => (
+              {!sessionManageIsListView ? (
+                <div className="session-list-left">
+                  <Tabs
+                    size="small"
+                    activeKey={sessionManageGroupTab}
+                    onChange={(key) => setSessionManageGroupTab(key as SessionManageGroupTabKey)}
+                    destroyOnHidden
+                    className="session-manage-group-tabs"
+                    items={[
+                      {
+                        key: "current",
+                        label: `当前 (${sessionManageGroupedItems.current.length})`,
+                        children: (
+                          <div className="session-manage-tab-pane">
+                            <SessionCandidateVirtualList
+                              items={sessionManageGroupedItems.current}
+                              empty_text="当前分组暂无会话"
+                              render_item={(item) => (
                                 <SessionCandidateCard
-                                  key={item.session_id}
                                   session_id={item.session_id}
                                   sid_short={shortSessionId(item.session_id)}
                                   selected={false}
@@ -7285,28 +9598,27 @@ function App() {
                                   record_count={item.record_count}
                                   source_files={item.source_files}
                                   first_input={item.first_input}
+                                  selection_status_text={item.synthetic_reason}
+                                  selection_status_color={item.synthetic ? "orange" : undefined}
                                   on_preview={() => void loadSessionManagePreview(sessionManagePaneId, item.session_id)}
                                   on_clear_current={() => void clearCurrentSessionFromManage(sessionManagePaneId)}
                                   clear_current_disabled={!sessionManagePane.active_session_id.trim()}
                                 />
-                              ))}
-                            </div>
-                          ) : (
-                            <Typography.Text type="secondary">当前分组暂无会话</Typography.Text>
-                          )}
-                        </div>
-                      )
-                    },
-                    {
-                      key: "linked",
-                      label: `关联 (${sessionManageGroupedItems.linked.length})`,
-                      children: (
-                        <div className="session-manage-tab-pane">
-                          {sessionManageGroupedItems.linked.length ? (
-                            <div className="session-inline-group-list">
-                              {sessionManageGroupedItems.linked.map((item) => (
+                              )}
+                            />
+                          </div>
+                        )
+                      },
+                      {
+                        key: "linked",
+                        label: `关联 (${sessionManageGroupedItems.linked.length})`,
+                        children: (
+                          <div className="session-manage-tab-pane">
+                            <SessionCandidateVirtualList
+                              items={sessionManageGroupedItems.linked}
+                              empty_text="关联分组暂无会话"
+                              render_item={(item) => (
                                 <SessionCandidateCard
-                                  key={item.session_id}
                                   session_id={item.session_id}
                                   sid_short={shortSessionId(item.session_id)}
                                   selected={false}
@@ -7317,6 +9629,8 @@ function App() {
                                   record_count={item.record_count}
                                   source_files={item.source_files}
                                   first_input={item.first_input}
+                                  selection_status_text={item.synthetic_reason}
+                                  selection_status_color={item.synthetic ? "orange" : undefined}
                                   on_preview={() => void loadSessionManagePreview(sessionManagePaneId, item.session_id)}
                                   on_remove_linked={() =>
                                     void removeLinkedSessionFromManage(sessionManagePaneId, item.session_id)
@@ -7325,24 +9639,21 @@ function App() {
                                     !sessionManagePane.linked_session_ids.includes(item.session_id)
                                   }
                                 />
-                              ))}
-                            </div>
-                          ) : (
-                            <Typography.Text type="secondary">关联分组暂无会话</Typography.Text>
-                          )}
-                        </div>
-                      )
-                    },
-                    {
-                      key: "unlinked",
-                      label: `未关联 (${sessionManageGroupedItems.unlinked.length})`,
-                      children: (
-                        <div className="session-manage-tab-pane">
-                          {sessionManageGroupedItems.unlinked.length ? (
-                            <div className="session-inline-group-list">
-                              {sessionManageGroupedItems.unlinked.map((item) => (
+                              )}
+                            />
+                          </div>
+                        )
+                      },
+                      {
+                        key: "unlinked",
+                        label: `未关联 (${sessionManageGroupedItems.unlinked.length})`,
+                        children: (
+                          <div className="session-manage-tab-pane">
+                            <SessionCandidateVirtualList
+                              items={sessionManageGroupedItems.unlinked}
+                              empty_text="未关联分组暂无会话"
+                              render_item={(item) => (
                                 <SessionCandidateCard
-                                  key={item.session_id}
                                   session_id={item.session_id}
                                   sid_short={shortSessionId(item.session_id)}
                                   selected={false}
@@ -7353,6 +9664,8 @@ function App() {
                                   record_count={item.record_count}
                                   source_files={item.source_files}
                                   first_input={item.first_input}
+                                  selection_status_text={item.synthetic_reason}
+                                  selection_status_color={item.synthetic ? "orange" : undefined}
                                   on_preview={() => void loadSessionManagePreview(sessionManagePaneId, item.session_id)}
                                   on_set_current={() =>
                                     void setSessionAsCurrentFromManage(sessionManagePaneId, item.session_id)
@@ -7365,20 +9678,18 @@ function App() {
                                   }
                                   add_linked_disabled={sessionManagePane.linked_session_ids.includes(item.session_id)}
                                 />
-                              ))}
-                            </div>
-                          ) : (
-                            <Typography.Text type="secondary">未关联分组暂无会话</Typography.Text>
-                          )}
-                        </div>
-                      )
-                    }
-                  ]}
-                />
-              </div>
+                              )}
+                            />
+                          </div>
+                        )
+                      }
+                    ]}
+                  />
+                </div>
+              ) : null}
 
-              <div className="session-list-right">
-                <Card size="small" title="会话预览">
+              <div className="session-list-right" style={sessionManageIsListView ? { width: "100%" } : undefined}>
+                <Card size="small" title={sessionManageIsListView ? "当前会话消息" : "会话预览"}>
                   <div className="session-preview-head">
                     <Typography.Text type="secondary">
                       SID：
@@ -7387,9 +9698,41 @@ function App() {
                         : "-"}
                     </Typography.Text>
                     <Space size={6}>
+                      <Button
+                        size="small"
+                        type={sessionManageListState.preview_auto_refresh ? "primary" : "default"}
+                        icon={<SyncOutlined spin={sessionManageListState.preview_auto_refresh} />}
+                        onClick={() => toggleSessionPreviewAutoRefresh(sessionManagePaneId)}
+                        disabled={!sessionManagePaneId || !sessionManagePreview.preview_session_id.trim()}
+                      >
+                        {sessionManageListState.preview_auto_refresh ? "自动刷新中" : "自动刷新"}
+                      </Button>
+                      <Button
+                        size="small"
+                        onClick={() => void jumpSessionManagePreviewToStart()}
+                        loading={sessionManagePreview.preview_loading && !sessionManagePreview.preview_from_end}
+                        disabled={!sessionManagePreview.preview_session_id.trim()}
+                      >
+                        开头
+                      </Button>
+                      <Button
+                        size="small"
+                        onClick={() => void jumpSessionManagePreviewToLatest()}
+                        loading={sessionManagePreview.preview_loading && sessionManagePreview.preview_from_end}
+                        disabled={!sessionManagePreview.preview_session_id.trim()}
+                      >
+                        最新
+                      </Button>
                       <Typography.Text type="secondary">
                         已加载 {sessionManagePreview.preview_loaded_rows}/{sessionManagePreview.preview_total_rows}
                       </Typography.Text>
+                      <Button
+                        size="small"
+                        onClick={() => setPreviewOverlaySource("session-manage")}
+                        disabled={!canOpenSessionManagePreviewOverlay}
+                      >
+                        弹窗预览
+                      </Button>
                       <Button
                         size="small"
                         onClick={() => void loadAllSessionManagePreviewRows()}
@@ -7411,25 +9754,28 @@ function App() {
                         show_checkbox={false}
                         user_avatar_src={userAvatarSrc}
                         assistant_avatar_src={assistantAvatarSrc}
-                        items={sessionManagePreview.preview_rows.map((row, index) => ({
-                          id: row.id || `${row.created_at}-${index}-${row.kind}`,
-                          kind: row.kind,
-                          content: row.content,
-                          created_at_text: formatTs(row.created_at),
-                          sid_text: sessionManagePreview.preview_session_id
-                            ? shortSessionId(sessionManagePreview.preview_session_id)
-                            : "-",
-                          included: true,
-                          preview_truncated: Boolean(row.preview_truncated)
-                        }))}
+                        scroll_command={sessionManagePreviewScrollCommand}
+                        items={sessionManagePreviewItems}
                         empty_text="当前会话暂无预览消息"
-                        on_request_full_content={(item) =>
-                          loadNativePreviewMessageDetail(
-                            sessionManagePaneId,
-                            sessionManagePreview.preview_session_id,
-                            item
-                          )
+                        on_reach_bottom={
+                          sessionManagePreview.preview_session_id.trim() && sessionManagePreview.preview_has_more
+                            ? () => {
+                                if (!sessionManagePreview.preview_from_end) {
+                                  void loadMoreSessionManagePreviewRows();
+                                }
+                              }
+                            : undefined
                         }
+                        on_reach_top={
+                          sessionManagePreview.preview_session_id.trim() && sessionManagePreview.preview_has_more
+                            ? () => {
+                                if (sessionManagePreview.preview_from_end) {
+                                  void loadMoreSessionManagePreviewRows();
+                                }
+                              }
+                            : undefined
+                        }
+                        on_request_full_content={loadSessionManagePreviewMessageDetail}
                       />
                     )}
                   </div>
@@ -7437,7 +9783,8 @@ function App() {
               </div>
             </div>
 
-            <div className="session-list-loadmore">
+            {!sessionManageIsListView ? (
+              <div className="session-list-loadmore">
               <Button
                 onClick={() => void loadMoreSessionListDialog(sessionManagePaneId)}
                 loading={sessionManageListState.loading_more}
@@ -7445,7 +9792,8 @@ function App() {
               >
                 {sessionManageListState.has_more ? "加载更多" : "已全部加载"}
               </Button>
-            </div>
+              </div>
+            ) : null}
           </>
         ) : (
           <Typography.Text type="secondary">未选择终端窗格</Typography.Text>
@@ -7581,6 +9929,7 @@ function App() {
                       size="small"
                       activeKey={syncDialogGroupTab}
                       onChange={(key) => setSyncDialogGroupTab(key as SessionManageGroupTabKey)}
+                      destroyOnHidden
                       className="session-manage-group-tabs"
                       items={[
                         {
@@ -7588,14 +9937,13 @@ function App() {
                           label: `当前 (${syncDialogGroupedItems.current.length})`,
                           children: (
                             <div className="session-manage-tab-pane">
-                              {syncDialogGroupedItems.current.length ? (
-                                <div className="session-inline-group-list">
-                                  {syncDialogGroupedItems.current.map((item) => (
-                                    (() => {
-                                      const badge = getSyncDialogSessionSelectionBadge(item.session_id);
-                                      return (
+                              <SessionCandidateVirtualList
+                                items={syncDialogGroupedItems.current}
+                                empty_text="当前分组暂无会话"
+                                render_item={(item) => {
+                                  const badge = getSyncDialogSessionSelectionBadge(item.session_id);
+                                  return (
                                     <SessionCandidateCard
-                                      key={item.session_id}
                                       session_id={item.session_id}
                                       sid_short={shortSessionId(item.session_id)}
                                       selected={syncDialogVisualSelectedSessionSet.has(item.session_id)}
@@ -7612,13 +9960,9 @@ function App() {
                                       }
                                       on_preview={() => void previewSyncDialogSession(syncDialog.pane_id, item.session_id)}
                                     />
-                                      );
-                                    })()
-                                  ))}
-                                </div>
-                              ) : (
-                                <Typography.Text type="secondary">当前分组暂无会话</Typography.Text>
-                              )}
+                                  );
+                                }}
+                              />
                             </div>
                           )
                         },
@@ -7627,14 +9971,13 @@ function App() {
                           label: `关联 (${syncDialogGroupedItems.linked.length})`,
                           children: (
                             <div className="session-manage-tab-pane">
-                              {syncDialogGroupedItems.linked.length ? (
-                                <div className="session-inline-group-list">
-                                  {syncDialogGroupedItems.linked.map((item) => (
-                                    (() => {
-                                      const badge = getSyncDialogSessionSelectionBadge(item.session_id);
-                                      return (
+                              <SessionCandidateVirtualList
+                                items={syncDialogGroupedItems.linked}
+                                empty_text="关联分组暂无会话"
+                                render_item={(item) => {
+                                  const badge = getSyncDialogSessionSelectionBadge(item.session_id);
+                                  return (
                                     <SessionCandidateCard
-                                      key={item.session_id}
                                       session_id={item.session_id}
                                       sid_short={shortSessionId(item.session_id)}
                                       selected={syncDialogVisualSelectedSessionSet.has(item.session_id)}
@@ -7651,13 +9994,9 @@ function App() {
                                       }
                                       on_preview={() => void previewSyncDialogSession(syncDialog.pane_id, item.session_id)}
                                     />
-                                      );
-                                    })()
-                                  ))}
-                                </div>
-                              ) : (
-                                <Typography.Text type="secondary">关联分组暂无会话</Typography.Text>
-                              )}
+                                  );
+                                }}
+                              />
                             </div>
                           )
                         },
@@ -7666,14 +10005,13 @@ function App() {
                           label: `未关联 (${syncDialogGroupedItems.unlinked.length})`,
                           children: (
                             <div className="session-manage-tab-pane">
-                              {syncDialogGroupedItems.unlinked.length ? (
-                                <div className="session-inline-group-list">
-                                  {syncDialogGroupedItems.unlinked.map((item) => (
-                                    (() => {
-                                      const badge = getSyncDialogSessionSelectionBadge(item.session_id);
-                                      return (
+                              <SessionCandidateVirtualList
+                                items={syncDialogGroupedItems.unlinked}
+                                empty_text="未关联分组暂无会话"
+                                render_item={(item) => {
+                                  const badge = getSyncDialogSessionSelectionBadge(item.session_id);
+                                  return (
                                     <SessionCandidateCard
-                                      key={item.session_id}
                                       session_id={item.session_id}
                                       sid_short={shortSessionId(item.session_id)}
                                       selected={syncDialogVisualSelectedSessionSet.has(item.session_id)}
@@ -7690,13 +10028,9 @@ function App() {
                                       }
                                       on_preview={() => void previewSyncDialogSession(syncDialog.pane_id, item.session_id)}
                                     />
-                                      );
-                                    })()
-                                  ))}
-                                </div>
-                              ) : (
-                                <Typography.Text type="secondary">未关联分组暂无会话</Typography.Text>
-                              )}
+                                  );
+                                }}
+                              />
                             </div>
                           )
                         }
@@ -7724,6 +10058,13 @@ function App() {
                   </Button>
                   <Button size="small" onClick={() => void jumpSyncDialogPreviewToLatest()}>
                     回到最新
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => setPreviewOverlaySource("sync-dialog")}
+                    disabled={!canOpenSyncDialogPreviewOverlay}
+                  >
+                    弹窗预览
                   </Button>
                   <Button
                     size="small"
@@ -7843,42 +10184,7 @@ function App() {
                   user_avatar_src={userAvatarSrc}
                   assistant_avatar_src={assistantAvatarSrc}
                   scroll_command={syncDialogPreviewScrollCommand}
-                  items={
-                    syncDialogPreviewSessionId
-                      ? syncDialogPreview.preview_rows.map((row, index) => {
-                          const entryId = row.id || `${row.created_at}-${index}-${row.kind}`;
-                          const previewEntry: EntryRecord = {
-                            id: entryId,
-                            pane_id: syncDialog.pane_id,
-                            kind: row.kind,
-                            content: row.content,
-                            synced_from: buildNativePreviewTag(syncDialogPreviewSessionId),
-                            created_at: row.created_at,
-                            preview_truncated: Boolean(row.preview_truncated)
-                          };
-                          return {
-                            id: entryId,
-                            kind: row.kind,
-                            content: row.content,
-                            created_at_text: formatTs(row.created_at),
-                            sid_text: shortSessionId(syncDialogPreviewSessionId),
-                            included: isSyncDialogEntryIncluded(previewEntry),
-                            preview_truncated: Boolean(row.preview_truncated)
-                          };
-                        })
-                      : syncDialogPreviewPanelEntries.map((entry) => {
-                          const sessionId = resolveEntrySessionId(entry, syncDialogCurrentSessionId);
-                          return {
-                            id: entry.id,
-                            kind: entry.kind,
-                            content: entry.content,
-                            created_at_text: formatTs(entry.created_at),
-                            sid_text: sessionId ? shortSessionId(sessionId) : "-",
-                            included: isSyncDialogEntryIncluded(entry),
-                            preview_truncated: Boolean(entry.preview_truncated)
-                          };
-                        })
-                  }
+                  items={syncDialogPreviewItems}
                   empty_text={
                     (syncDialogPreviewSessionId ? syncDialogPreview.preview_rows.length : syncDialogFilteredEntries.length)
                       ? "当前预览会话在筛选条件下暂无记录"
@@ -7905,25 +10211,121 @@ function App() {
                   on_toggle_included={(entryId, included) =>
                     toggleSyncDialogEntryExcluded(entryId, !included)
                   }
-                  on_request_full_content={(item) =>
-                    loadNativePreviewMessageDetail(
-                      syncDialog.pane_id,
-                      syncDialogPreviewSessionId || resolveEntrySessionId(syncDialog.entries.find((entry) => entry.id === item.id) || {
-                        id: item.id,
-                        pane_id: syncDialog.pane_id,
-                        kind: item.kind,
-                        content: item.content,
-                        synced_from: buildNativePreviewTag(syncDialogPreviewSessionId),
-                        created_at: 0
-                      }, syncDialogCurrentSessionId),
-                      item
-                    )
-                  }
+                  on_request_full_content={loadSyncDialogPreviewMessageDetail}
                 />
               </>
             )}
           </Card>
         </div>
+      </Modal>
+
+      <Modal
+        open={previewOverlaySource !== null}
+        title={previewOverlayTitle}
+        onCancel={() => setPreviewOverlaySource(null)}
+        footer={null}
+        width={1200}
+        centered
+        getContainer={() => document.body}
+        className="session-preview-overlay-modal"
+        destroyOnClose={false}
+      >
+        {previewOverlaySource === "session-manage" ? (
+          <>
+            <div className="session-preview-overlay-meta">
+              <Space size={[8, 8]} wrap>
+                <Typography.Text type="secondary">
+                  SID：{sessionManagePreview.preview_session_id ? shortSessionId(sessionManagePreview.preview_session_id) : "-"}
+                </Typography.Text>
+                <Button
+                  size="small"
+                  onClick={() => void jumpSessionManagePreviewToStart()}
+                  loading={sessionManagePreview.preview_loading && !sessionManagePreview.preview_from_end}
+                  disabled={!sessionManagePreview.preview_session_id.trim()}
+                >
+                  开头
+                </Button>
+                <Button
+                  size="small"
+                  onClick={() => void jumpSessionManagePreviewToLatest()}
+                  loading={sessionManagePreview.preview_loading && sessionManagePreview.preview_from_end}
+                  disabled={!sessionManagePreview.preview_session_id.trim()}
+                >
+                  最新
+                </Button>
+                <Typography.Text type="secondary">
+                  已加载 {sessionManagePreview.preview_loaded_rows}/{sessionManagePreview.preview_total_rows}
+                </Typography.Text>
+              </Space>
+            </div>
+            <div className="session-preview-overlay-content">
+              {previewOverlayLoading ? (
+                <div className="session-preview-loading">
+                  <Spin />
+                </div>
+              ) : (
+                <SyncEntryPreviewList
+                  show_checkbox={false}
+                  user_avatar_src={userAvatarSrc}
+                  assistant_avatar_src={assistantAvatarSrc}
+                  scroll_command={sessionManagePreviewScrollCommand}
+                  items={sessionManagePreviewItems}
+                  empty_text={previewOverlayEmptyText}
+                  on_reach_bottom={
+                    sessionManagePreview.preview_session_id.trim() && sessionManagePreview.preview_has_more
+                      ? () => {
+                          if (!sessionManagePreview.preview_from_end) {
+                            void loadMoreSessionManagePreviewRows();
+                          }
+                        }
+                      : undefined
+                  }
+                  on_reach_top={
+                    sessionManagePreview.preview_session_id.trim() && sessionManagePreview.preview_has_more
+                      ? () => {
+                          if (sessionManagePreview.preview_from_end) {
+                            void loadMoreSessionManagePreviewRows();
+                          }
+                        }
+                      : undefined
+                  }
+                  on_request_full_content={loadSessionManagePreviewMessageDetail}
+                />
+              )}
+            </div>
+          </>
+        ) : previewOverlaySource === "sync-dialog" ? (
+          <>
+            <div className="session-preview-overlay-meta">
+              <Space size={[8, 8]} wrap>
+                <Typography.Text type="secondary">
+                  预览会话：{syncDialogPreviewSessionId ? shortSessionId(syncDialogPreviewSessionId) : "已选会话汇总"}
+                </Typography.Text>
+                <Tag color={syncDialogPreviewSessionId ? "blue" : "default"}>
+                  {syncDialogPreviewSelectionText}
+                </Tag>
+              </Space>
+            </div>
+            <div className="session-preview-overlay-content">
+              {previewOverlayLoading ? (
+                <div className="session-preview-loading">
+                  <Spin />
+                </div>
+              ) : (
+                <SyncEntryPreviewList
+                  user_avatar_src={userAvatarSrc}
+                  assistant_avatar_src={assistantAvatarSrc}
+                  items={syncDialogPreviewItems}
+                  empty_text={previewOverlayEmptyText}
+                  on_toggle_included={(entryId, included) =>
+                    toggleSyncDialogEntryExcluded(entryId, !included)
+                  }
+                  on_request_full_content={loadSyncDialogPreviewMessageDetail}
+                />
+              )}
+            </div>
+          </>
+        ) : null}
       </Modal>
 
     </ConfigProvider>
