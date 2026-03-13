@@ -48,19 +48,22 @@ import {
 import "xterm/css/xterm.css";
 import SyncEntryPreviewList, {
   type SyncEntryPreviewFullContentResult,
-  type SyncEntryPreviewItem
+  type SyncEntryPreviewItem,
+  type SyncEntryPreviewScrollCommand
 } from "./components/SyncEntryPreviewList";
 import SessionCandidateCard from "./components/SessionCandidateCard";
 import SessionCandidateVirtualList from "./components/SessionCandidateVirtualList";
 import JsonPathTree, { type JsonPathToken } from "./components/JsonPathTree";
 import AiTeamMcpPage, { type AiTeamWorkbenchHeaderActions } from "./pages/AiTeamMcpPage";
+import CollabWorkbenchPage from "./pages/CollabWorkbenchPage";
+import FavoriteMessagesPage from "./pages/FavoriteMessagesPage";
 import defaultAssistantAvatar from "../ai.jpg";
 import defaultUserAvatar from "../man.jpg";
 
 type Provider = string;
 type LayoutMode = "vertical" | "horizontal";
 type UiColorMode = "dark" | "light" | "system";
-type AppRoute = "workspace" | "team" | "ai-team" | "session-preview";
+type AppRoute = "workspace" | "team" | "ai-team" | "collab" | "favorites" | "session-preview";
 type StandaloneSessionPreviewTargetPayload = {
   paneId: string;
 };
@@ -73,6 +76,12 @@ const STANDALONE_SESSION_PREVIEW_DEFAULT_WIDTH = 1180;
 const STANDALONE_SESSION_PREVIEW_DEFAULT_HEIGHT = 820;
 const STANDALONE_SESSION_PREVIEW_MIN_WIDTH = 360;
 const STANDALONE_SESSION_PREVIEW_MIN_HEIGHT = 420;
+const STANDALONE_COLLAB_WORKBENCH_WINDOW_LABEL = "collab-workbench";
+const STANDALONE_COLLAB_WORKBENCH_WINDOW_TITLE = "协作工作台";
+const STANDALONE_COLLAB_WORKBENCH_DEFAULT_WIDTH = 1420;
+const STANDALONE_COLLAB_WORKBENCH_DEFAULT_HEIGHT = 920;
+const STANDALONE_COLLAB_WORKBENCH_MIN_WIDTH = 960;
+const STANDALONE_COLLAB_WORKBENCH_MIN_HEIGHT = 640;
 const STANDALONE_SESSION_PREVIEW_COMPACT_TARGET_WIDTH = 420;
 const STANDALONE_SESSION_PREVIEW_COMPACT_TARGET_HEIGHT = 620;
 const STANDALONE_SESSION_PREVIEW_ANCHOR_MARGIN = 24;
@@ -108,6 +117,12 @@ function resolveAppRouteFromPath(pathname: string): AppRoute | null {
   if (normalized === "/ai-team") {
     return "ai-team";
   }
+  if (normalized === "/collab") {
+    return "collab";
+  }
+  if (normalized === "/favorites") {
+    return "favorites";
+  }
   if (normalized === "/") {
     return "workspace";
   }
@@ -131,6 +146,12 @@ function resolveAppRouteFromHash(hash: string): AppRoute | null {
   }
   if (normalized === "#/ai-team") {
     return "ai-team";
+  }
+  if (normalized === "#/collab") {
+    return "collab";
+  }
+  if (normalized === "#/favorites") {
+    return "favorites";
   }
   if (normalized === "#/" || normalized === "#/workspace") {
     return "workspace";
@@ -157,6 +178,10 @@ function buildStandaloneSessionPreviewUrl(paneId: string): string {
   }
   const query = params.toString();
   return query ? `/session-preview?${query}` : "/session-preview";
+}
+
+function buildStandaloneCollabWorkbenchUrl(): string {
+  return "/collab";
 }
 
 function readStandaloneSessionPreviewAlwaysOnTopPreference(): boolean {
@@ -729,6 +754,30 @@ type NativeSessionMessageDetailResponse = {
 type NativeSessionMessageSelection = {
   messageId: string;
   sessionId: string;
+};
+
+type FavoriteMessageRecord = {
+  id: string;
+  pane_id: string;
+  pane_title: string;
+  provider: string;
+  session_id: string;
+  message_id: string;
+  kind: string;
+  content: string;
+  created_at: number;
+  favorited_at: number;
+};
+
+type FavoriteMessageUpsertInput = {
+  paneId: string;
+  paneTitle: string;
+  provider: string;
+  sessionId: string;
+  messageId: string;
+  kind: string;
+  content: string;
+  createdAt: number;
 };
 
 type NativeUnrecognizedFilePreviewResponse = {
@@ -1640,6 +1689,38 @@ function compareEntryByTime(a: EntryRecord, b: EntryRecord): number {
   return a.id.localeCompare(b.id);
 }
 
+function buildFavoriteMessageKey(target: {
+  pane_id: string;
+  session_id: string;
+  message_id: string;
+}): string {
+  return [
+    target.pane_id.trim(),
+    target.session_id.trim(),
+    target.message_id.trim()
+  ].join("::");
+}
+
+function buildFavoriteMessageKeyFromRecord(item: FavoriteMessageRecord): string {
+  return buildFavoriteMessageKey({
+    pane_id: item.pane_id,
+    session_id: item.session_id,
+    message_id: item.message_id
+  });
+}
+
+function buildFavoriteMessageKeyFromPreviewItem(item: SyncEntryPreviewItem): string {
+  const target = item.favorite_target;
+  if (!target) {
+    return "";
+  }
+  return buildFavoriteMessageKey({
+    pane_id: target.pane_id,
+    session_id: target.session_id,
+    message_id: item.id
+  });
+}
+
 function compareNativePreviewRowByTime(a: NativeSessionPreviewRow, b: NativeSessionPreviewRow): number {
   if (a.created_at !== b.created_at) {
     return a.created_at - b.created_at;
@@ -2142,11 +2223,18 @@ function groupSessionCandidatesForManage(
 
 function App() {
   const [messageApi, contextHolder] = message.useMessage();
+  const currentWebviewWindow = getCurrentWebviewWindow();
+  const currentWebviewLabel = currentWebviewWindow.label;
   const [route, setRoute] = useState<AppRoute>(() => resolveAppRoute());
   const [standaloneSessionPreviewPaneId, setStandaloneSessionPreviewPaneId] = useState(() =>
     typeof window !== "undefined" ? resolveStandaloneSessionPreviewPaneIdFromSearch(window.location.search) : ""
   );
   const isTeamRoute = route === "team";
+  const isAiTeamRoute = route === "ai-team";
+  const isCollabRoute = route === "collab";
+  const isFavoritesRoute = route === "favorites";
+  const isStandaloneCollabWindow =
+    isCollabRoute && currentWebviewLabel === STANDALONE_COLLAB_WORKBENCH_WINDOW_LABEL;
   const isStandaloneSessionPreviewRoute = route === "session-preview";
   const isWorkspaceLikeRoute = route === "workspace" || route === "team";
   const [loading, setLoading] = useState(true);
@@ -2162,9 +2250,13 @@ function App() {
         ? "/team"
         : target === "ai-team"
           ? "/ai-team"
-          : target === "session-preview"
-            ? "/session-preview"
-            : "/";
+          : target === "collab"
+            ? "/collab"
+            : target === "favorites"
+              ? "/favorites"
+              : target === "session-preview"
+                ? "/session-preview"
+                : "/";
     const currentPath = normalizeAppPathname(window.location.pathname);
     if (currentPath !== path) {
       try {
@@ -2234,8 +2326,8 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (route !== "ai-team") {
-      setAiTeamHeaderActions(null);
+    if (route !== "ai-team" && route !== "collab") {
+      setWorkbenchHeaderActions(null);
     }
   }, [route]);
 
@@ -2292,16 +2384,16 @@ function App() {
   const [syncDialogPreview, setSyncDialogPreview] = useState<SyncDialogPreviewState>(() =>
     createSyncDialogPreviewState()
   );
+  const [favoriteMessages, setFavoriteMessages] = useState<FavoriteMessageRecord[]>([]);
   const [previewOverlaySource, setPreviewOverlaySource] = useState<PreviewOverlaySource | null>(null);
-  const [sessionManagePreviewScrollCommand, setSessionManagePreviewScrollCommand] = useState<
-    { target: "top" | "bottom"; nonce: number } | null
-  >(null);
-  const [syncDialogPreviewScrollCommand, setSyncDialogPreviewScrollCommand] = useState<
-    { target: "top" | "bottom"; nonce: number } | null
-  >(null);
+  const [sessionManagePreviewScrollCommand, setSessionManagePreviewScrollCommand] =
+    useState<SyncEntryPreviewScrollCommand | null>(null);
+  const [syncDialogPreviewScrollCommand, setSyncDialogPreviewScrollCommand] =
+    useState<SyncEntryPreviewScrollCommand | null>(null);
+  const [sessionManageHighlightedMessageId, setSessionManageHighlightedMessageId] = useState("");
   const [syncShowSelectedOnly, setSyncShowSelectedOnly] = useState(false);
   const [clearingAllSid, setClearingAllSid] = useState(false);
-  const [aiTeamHeaderActions, setAiTeamHeaderActions] = useState<AiTeamWorkbenchHeaderActions | null>(null);
+  const [workbenchHeaderActions, setWorkbenchHeaderActions] = useState<AiTeamWorkbenchHeaderActions | null>(null);
   const [standaloneSessionPreviewAlwaysOnTop, setStandaloneSessionPreviewAlwaysOnTop] = useState(() =>
     readStandaloneSessionPreviewAlwaysOnTopPreference()
   );
@@ -3082,14 +3174,29 @@ function App() {
         id: row.id || `${row.created_at}-${index}-${row.kind}`,
         kind: row.kind,
         content: row.content,
+        created_at: row.created_at,
         created_at_text: formatTs(row.created_at),
         sid_text: sessionManagePreview.preview_session_id
           ? shortSessionId(sessionManagePreview.preview_session_id)
           : "-",
         included: true,
-        preview_truncated: Boolean(row.preview_truncated)
+        preview_truncated: Boolean(row.preview_truncated),
+        favorite_target: sessionManagePaneId && sessionManagePreview.preview_session_id
+          ? {
+              pane_id: sessionManagePaneId,
+              pane_title: sessionManagePane?.title || "",
+              provider: sessionManagePane?.provider || "",
+              session_id: sessionManagePreview.preview_session_id
+            }
+          : undefined
       })),
-    [sessionManagePreview.preview_rows, sessionManagePreview.preview_session_id]
+    [
+      sessionManagePane?.provider,
+      sessionManagePane?.title,
+      sessionManagePaneId,
+      sessionManagePreview.preview_rows,
+      sessionManagePreview.preview_session_id
+    ]
   );
   const resolveSyncDialogPreviewItemSessionId = useCallback(
     (item: Pick<SyncEntryPreviewItem, "id" | "kind" | "content">): string => {
@@ -3139,10 +3246,19 @@ function App() {
               id: entryId,
               kind: row.kind,
               content: row.content,
+              created_at: row.created_at,
               created_at_text: formatTs(row.created_at),
               sid_text: shortSessionId(syncDialogPreviewSessionId),
               included: isSyncDialogEntryIncluded(previewEntry),
-              preview_truncated: Boolean(row.preview_truncated)
+              preview_truncated: Boolean(row.preview_truncated),
+              favorite_target: syncDialog.pane_id
+                ? {
+                    pane_id: syncDialog.pane_id,
+                    pane_title: syncDialogPane?.title || "",
+                    provider: syncDialogPane?.provider || "",
+                    session_id: syncDialogPreviewSessionId
+                  }
+                : undefined
             };
           })
         : syncDialogPreviewPanelEntries.map((entry) => {
@@ -3151,6 +3267,7 @@ function App() {
               id: entry.id,
               kind: entry.kind,
               content: entry.content,
+              created_at: entry.created_at,
               created_at_text: formatTs(entry.created_at),
               sid_text: sessionId ? shortSessionId(sessionId) : "-",
               included: isSyncDialogEntryIncluded(entry),
@@ -3161,10 +3278,23 @@ function App() {
       isSyncDialogEntryIncluded,
       syncDialog.pane_id,
       syncDialogCurrentSessionId,
+      syncDialogPane?.provider,
+      syncDialogPane?.title,
       syncDialogPreview.preview_rows,
       syncDialogPreviewPanelEntries,
       syncDialogPreviewSessionId
     ]
+  );
+  const favoriteMessageMap = useMemo(
+    () => new Map(favoriteMessages.map((item) => [buildFavoriteMessageKeyFromRecord(item), item] as const)),
+    [favoriteMessages]
+  );
+  const isPreviewMessageFavorited = useCallback(
+    (item: SyncEntryPreviewItem) => {
+      const key = buildFavoriteMessageKeyFromPreviewItem(item);
+      return key ? favoriteMessageMap.has(key) : false;
+    },
+    [favoriteMessageMap]
   );
   const canOpenSessionManagePreviewOverlay = Boolean(
     sessionManagePreview.preview_session_id.trim() ||
@@ -3228,6 +3358,10 @@ function App() {
         (pane) => pane.active_session_id.trim().length > 0 || pane.linked_session_ids.length > 0
       ),
     [panes]
+  );
+  const allSessionPanelsOpen = useMemo(
+    () => panes.length > 0 && panes.every((pane) => Boolean(sessionListPanels[pane.id]?.open)),
+    [panes, sessionListPanels]
   );
   const sessionManageProgressState = useMemo(() => {
     const loadedSessions = Math.max(0, sessionManageListState?.items.length ?? 0);
@@ -3915,6 +4049,21 @@ function App() {
     []
   );
 
+  const loadFavoriteMessages = useCallback(
+    async (silent = false) => {
+      try {
+        const response = await invoke<FavoriteMessageRecord[]>("list_favorite_messages");
+        setFavoriteMessages(Array.isArray(response) ? response : []);
+      } catch (error) {
+        console.error(error);
+        if (!silent) {
+          messageApi.error("加载收藏消息失败");
+        }
+      }
+    },
+    [messageApi]
+  );
+
   useEffect(() => {
     let disposed = false;
 
@@ -4039,6 +4188,10 @@ function App() {
     refreshScanProgress,
     standaloneSessionPreviewPaneId
   ]);
+
+  useEffect(() => {
+    void loadFavoriteMessages(true);
+  }, [loadFavoriteMessages]);
 
   useEffect(() => {
     if (!isStandaloneSessionPreviewRoute || !panes.length) {
@@ -5757,6 +5910,7 @@ function App() {
         preview_from_end: viewMode === "list" ? true : panel.preview_from_end
       });
       setSessionManagePreviewScrollCommand(null);
+      setSessionManageHighlightedMessageId("");
       setSessionManageGroupTab("current");
       setSessionManageScanConfig(null);
       void invoke<PaneScanConfig>("get_pane_scan_config", { paneId: pane.id })
@@ -6386,6 +6540,64 @@ function App() {
     }));
   }, [loadSessionManagePreview, sessionManagePaneId, sessionManagePreview.preview_session_id]);
 
+  const openFavoriteMessageInSessionManage = useCallback(
+    async (favorite: FavoriteMessageRecord) => {
+      const paneId = favorite.pane_id.trim();
+      const sessionId = favorite.session_id.trim();
+      const messageId = favorite.message_id.trim();
+      if (!paneId || !sessionId || !messageId) {
+        messageApi.error("收藏记录缺少定位信息");
+        return;
+      }
+
+      const pane = panes.find((item) => item.id === paneId);
+      if (!pane) {
+        messageApi.error("收藏对应的窗格不存在");
+        return;
+      }
+
+      navigateTo("workspace");
+      setPreviewOverlaySource(null);
+      openSessionManageDialog(paneId, "manage");
+      if (pane.active_session_id.trim() === sessionId) {
+        setSessionManageGroupTab("current");
+      } else if (parseSessionIds(pane.linked_session_ids).includes(sessionId)) {
+        setSessionManageGroupTab("linked");
+      } else {
+        setSessionManageGroupTab("unlinked");
+      }
+
+      try {
+        await reloadSessionListDialog(paneId, undefined, {
+          fullLoad: true,
+          keepPanelClosed: true
+        });
+        await loadSessionManagePreview(paneId, sessionId, true, {
+          fromEnd: false,
+          offset: 0,
+          mergeMode: "replace"
+        });
+        setSessionManageHighlightedMessageId(messageId);
+        setSessionManagePreviewScrollCommand((current) => ({
+          target: "item",
+          item_id: messageId,
+          nonce: (current?.nonce || 0) + 1
+        }));
+      } catch (error) {
+        console.error(error);
+        messageApi.error("打开收藏消息失败");
+      }
+    },
+    [
+      loadSessionManagePreview,
+      messageApi,
+      navigateTo,
+      openSessionManageDialog,
+      panes,
+      reloadSessionListDialog
+    ]
+  );
+
   const refreshSessionManageLiveView = useCallback(
     async (paneId: string, previewSessionId?: string, loadAll = false) => {
       const normalizedPaneId = paneId.trim();
@@ -6686,6 +6898,60 @@ function App() {
     [alignStandaloneSessionPreviewWindow, messageApi, panes, resolveStandaloneSessionPreviewInitialPosition]
   );
 
+  const openStandaloneCollabWorkbenchWindow = useCallback(async () => {
+    try {
+      const existingWindow = await WebviewWindow.getByLabel(STANDALONE_COLLAB_WORKBENCH_WINDOW_LABEL);
+      if (existingWindow) {
+        await existingWindow.setTitle(STANDALONE_COLLAB_WORKBENCH_WINDOW_TITLE).catch((error) =>
+          console.error(error)
+        );
+        await alignStandaloneSessionPreviewWindow(
+          existingWindow,
+          STANDALONE_COLLAB_WORKBENCH_DEFAULT_WIDTH,
+          STANDALONE_COLLAB_WORKBENCH_DEFAULT_HEIGHT
+        ).catch((error) => console.error(error));
+        await existingWindow.show().catch((error) => console.error(error));
+        await existingWindow.setFocus().catch((error) => console.error(error));
+        return;
+      }
+
+      const initialPosition = await resolveStandaloneSessionPreviewInitialPosition(
+        STANDALONE_COLLAB_WORKBENCH_DEFAULT_WIDTH,
+        STANDALONE_COLLAB_WORKBENCH_DEFAULT_HEIGHT
+      );
+      const collabWindow = new WebviewWindow(STANDALONE_COLLAB_WORKBENCH_WINDOW_LABEL, {
+        url: buildStandaloneCollabWorkbenchUrl(),
+        title: STANDALONE_COLLAB_WORKBENCH_WINDOW_TITLE,
+        width: STANDALONE_COLLAB_WORKBENCH_DEFAULT_WIDTH,
+        height: STANDALONE_COLLAB_WORKBENCH_DEFAULT_HEIGHT,
+        minWidth: STANDALONE_COLLAB_WORKBENCH_MIN_WIDTH,
+        minHeight: STANDALONE_COLLAB_WORKBENCH_MIN_HEIGHT,
+        x: initialPosition.x,
+        y: initialPosition.y,
+        resizable: true,
+        focus: true
+      });
+      collabWindow.once("tauri://created", () => {
+        void alignStandaloneSessionPreviewWindow(
+          collabWindow,
+          STANDALONE_COLLAB_WORKBENCH_DEFAULT_WIDTH,
+          STANDALONE_COLLAB_WORKBENCH_DEFAULT_HEIGHT
+        ).catch((error) => console.error(error));
+      });
+      collabWindow.once("tauri://error", (event) => {
+        console.error(event);
+        messageApi.error("打开协作工作台窗口失败");
+      });
+    } catch (error) {
+      console.error(error);
+      messageApi.error("打开协作工作台窗口失败");
+    }
+  }, [
+    alignStandaloneSessionPreviewWindow,
+    messageApi,
+    resolveStandaloneSessionPreviewInitialPosition
+  ]);
+
   useEffect(() => {
     if (!isStandaloneSessionPreviewRoute) {
       return;
@@ -6908,6 +7174,12 @@ function App() {
     }
   }, [previewOverlaySource, sessionManageDialog.open, syncDialog.open]);
 
+  useEffect(() => {
+    if (!sessionManageDialog.open) {
+      setSessionManageHighlightedMessageId("");
+    }
+  }, [sessionManageDialog.open]);
+
   const loadNativePreviewMessageDetail = useCallback(
     async (
       paneId: string,
@@ -6962,6 +7234,79 @@ function App() {
       resolveSyncDialogPreviewItemSessionId,
       syncDialog.pane_id
     ]
+  );
+  const togglePreviewMessageFavorite = useCallback(
+    async (
+      item: SyncEntryPreviewItem,
+      nextFavorited: boolean,
+      resolvedDetail?: SyncEntryPreviewFullContentResult | null
+    ) => {
+      const target = item.favorite_target;
+      if (!target) {
+        messageApi.warning("当前消息不支持收藏");
+        return;
+      }
+
+      const favoriteKey = buildFavoriteMessageKey({
+        pane_id: target.pane_id,
+        session_id: target.session_id,
+        message_id: item.id
+      });
+      const existing = favoriteMessageMap.get(favoriteKey);
+
+      if (!nextFavorited) {
+        if (!existing) {
+          return;
+        }
+        await invoke<void>("delete_favorite_message", {
+          favoriteId: existing.id
+        });
+        setFavoriteMessages((current) => current.filter((favorite) => favorite.id !== existing.id));
+        messageApi.success("已取消收藏");
+        return;
+      }
+
+      const pane = panes.find((entry) => entry.id === target.pane_id);
+      const response = await invoke<FavoriteMessageRecord>("upsert_favorite_message", {
+        payload: {
+          paneId: target.pane_id,
+          paneTitle: target.pane_title || pane?.title || "",
+          provider: target.provider || pane?.provider || "",
+          sessionId: target.session_id,
+          messageId: item.id,
+          kind: resolvedDetail?.kind || item.kind,
+          content: resolvedDetail?.content || item.content,
+          createdAt: Math.max(0, Number(item.created_at || 0))
+        } satisfies FavoriteMessageUpsertInput
+      });
+      setFavoriteMessages((current) => {
+        const withoutCurrent = current.filter((favorite) => favorite.id !== response.id);
+        return [response, ...withoutCurrent].sort((a, b) => {
+          if (b.favorited_at !== a.favorited_at) {
+            return b.favorited_at - a.favorited_at;
+          }
+          return b.created_at - a.created_at;
+        });
+      });
+      messageApi.success("已收藏消息");
+    },
+    [favoriteMessageMap, messageApi, panes]
+  );
+  const removeFavoriteMessage = useCallback(
+    async (favoriteId: string) => {
+      const normalizedFavoriteId = favoriteId.trim();
+      if (!normalizedFavoriteId) {
+        return;
+      }
+      await invoke<void>("delete_favorite_message", {
+        favoriteId: normalizedFavoriteId
+      });
+      setFavoriteMessages((current) =>
+        current.filter((favorite) => favorite.id !== normalizedFavoriteId)
+      );
+      messageApi.success("已取消收藏");
+    },
+    [messageApi]
   );
 
   const toggleSessionListSortField = useCallback(
@@ -7563,6 +7908,14 @@ function App() {
     }
   }, [nextSessionListLoadTicket, nextSessionPreviewLoadTicket, panes, updateSessionListPanelState]);
 
+  const toggleAllSessionPanels = useCallback(async () => {
+    if (allSessionPanelsOpen) {
+      closeAllSessionPanels();
+      return;
+    }
+    await openAllSessionPanels();
+  }, [allSessionPanelsOpen, closeAllSessionPanels, openAllSessionPanels]);
+
   useEffect(() => {
     if (!panes.length || sessionPanelBootRef.current) {
       return;
@@ -7902,14 +8255,23 @@ function App() {
                                 id: row.id || `${row.created_at}-${index}-${row.kind}`,
                                 kind: row.kind,
                                 content: row.content,
+                                created_at: row.created_at,
                                 created_at_text: formatTs(row.created_at),
                                 sid_text: sessionManagePreview.preview_session_id
                                   ? shortSessionId(sessionManagePreview.preview_session_id)
                                   : "-",
                                 included: true,
-                                preview_truncated: Boolean(row.preview_truncated)
+                                preview_truncated: Boolean(row.preview_truncated),
+                                favorite_target: {
+                                  pane_id: standaloneSessionPreviewPane.id,
+                                  pane_title: standaloneSessionPreviewPane.title || "",
+                                  provider: standaloneSessionPreviewPane.provider || "",
+                                  session_id: sessionManagePreview.preview_session_id
+                                }
                               }))}
                               empty_text="当前会话暂无预览消息"
+                              is_favorited={isPreviewMessageFavorited}
+                              on_toggle_favorite={togglePreviewMessageFavorite}
                               on_request_full_content={(item) =>
                                 loadNativePreviewMessageDetail(
                                   standaloneSessionPreviewPane.id,
@@ -7955,7 +8317,7 @@ function App() {
                 />
               </>
             ) : (
-              (aiTeamHeaderActions?.left ?? []).map((action) => (
+              (workbenchHeaderActions?.left ?? []).map((action) => (
                 <Button
                   key={action.key}
                   type={action.primary ? "primary" : "default"}
@@ -7980,20 +8342,26 @@ function App() {
                 >
                   清空全部SID
                 </Button>
-                <Button onClick={() => navigateTo(isTeamRoute ? "workspace" : "team")}>
-                  {isTeamRoute ? "回到终端页" : "团队工作台"}
+                <Button onClick={() => void openStandaloneCollabWorkbenchWindow()}>
+                  协作工作台
                 </Button>
-                <Button type="primary" onClick={() => void openAllSessionPanels()}>
-                  全部展开会话
+                <Button onClick={() => navigateTo("favorites")}>
+                  收藏消息
                 </Button>
-                <Button onClick={() => closeAllSessionPanels()}>全部收起会话</Button>
+                <Button
+                  type={allSessionPanelsOpen ? "default" : "primary"}
+                  disabled={!panes.length}
+                  onClick={() => void toggleAllSessionPanels()}
+                >
+                  {allSessionPanelsOpen ? "全部收起会话" : "全部展开会话"}
+                </Button>
                 <Button icon={<SettingOutlined />} onClick={() => setConfigOpen(true)}>
                   配置
                 </Button>
               </>
             ) : (
               <>
-                {(aiTeamHeaderActions?.right ?? []).map((action) => (
+                {(workbenchHeaderActions?.right ?? []).map((action) => (
                   <Button
                     key={action.key}
                     type={action.primary ? "primary" : "default"}
@@ -8005,11 +8373,24 @@ function App() {
                     {action.label}
                   </Button>
                 ))}
+                {!isFavoritesRoute ? (
+                  <Button onClick={() => navigateTo("favorites")}>
+                    收藏消息
+                  </Button>
+                ) : null}
                 <Button icon={<SettingOutlined />} onClick={() => setConfigOpen(true)}>
                   通用配置
                 </Button>
-                <Button onClick={() => navigateTo("workspace")}>
-                  终端工作台
+                <Button
+                  onClick={() => {
+                    if (isStandaloneCollabWindow) {
+                      void currentWebviewWindow.close().catch((error) => console.error(error));
+                      return;
+                    }
+                    navigateTo("workspace");
+                  }}
+                >
+                  {isStandaloneCollabWindow ? "关闭窗口" : "终端工作台"}
                 </Button>
               </>
             )}
@@ -8261,16 +8642,27 @@ function App() {
                                 id: row.id || `${row.created_at}-${index}-${row.kind}`,
                                 kind: row.kind,
                                 content: row.content,
+                                created_at: row.created_at,
                                 created_at_text: formatTs(row.created_at),
                                 sid_text: inlinePreviewSessionId
                                   ? shortSessionId(inlinePreviewSessionId)
                                   : "-",
                                 included: true,
-                                preview_truncated: Boolean(row.preview_truncated)
+                                preview_truncated: Boolean(row.preview_truncated),
+                                favorite_target: inlinePreviewSessionId
+                                  ? {
+                                      pane_id: pane.id,
+                                      pane_title: pane.title || "",
+                                      provider: pane.provider || "",
+                                      session_id: inlinePreviewSessionId
+                                    }
+                                  : undefined
                               }))}
                               empty_text={
                                 inlinePreviewSessionId ? "当前 SID 暂无预览消息" : "当前窗格未绑定 SID"
                               }
+                              is_favorited={isPreviewMessageFavorited}
+                              on_toggle_favorite={togglePreviewMessageFavorite}
                               on_request_full_content={(item) =>
                                 loadNativePreviewMessageDetail(
                                   pane.id,
@@ -8294,15 +8686,40 @@ function App() {
                 })}
               </main>
             </div>
-          ) : (
+          ) : isFavoritesRoute ? (
+            <FavoriteMessagesPage
+              favorites={favoriteMessages}
+              loading={loading}
+              onRefresh={() => void loadFavoriteMessages()}
+              onOpenFavorite={(favorite) => void openFavoriteMessageInSessionManage(favorite)}
+              onRemoveFavorite={(favoriteId) => void removeFavoriteMessage(favoriteId)}
+              onClose={() => navigateTo("workspace")}
+            />
+          ) : isAiTeamRoute ? (
             <AiTeamMcpPage
               providers={providers}
               defaultProjectDirectory={workingDirectory}
               onOpenCommonSettings={() => setConfigOpen(true)}
               onSyncPaneSessionState={hydratePaneSessionState}
               onProbePaneSessionId={readPaneSessionIdFromTerminal}
-              onHeaderActionsChange={setAiTeamHeaderActions}
+              onHeaderActionsChange={setWorkbenchHeaderActions}
               onClose={() => {
+                navigateTo("workspace");
+              }}
+            />
+          ) : (
+            <CollabWorkbenchPage
+              providers={providers}
+              defaultProjectDirectory={workingDirectory}
+              onOpenCommonSettings={() => setConfigOpen(true)}
+              onSyncPaneSessionState={hydratePaneSessionState}
+              onProbePaneSessionId={readPaneSessionIdFromTerminal}
+              onHeaderActionsChange={setWorkbenchHeaderActions}
+              onClose={() => {
+                if (isStandaloneCollabWindow) {
+                  void currentWebviewWindow.close().catch((error) => console.error(error));
+                  return;
+                }
                 navigateTo("workspace");
               }}
             />
@@ -9755,6 +10172,7 @@ function App() {
                         user_avatar_src={userAvatarSrc}
                         assistant_avatar_src={assistantAvatarSrc}
                         scroll_command={sessionManagePreviewScrollCommand}
+                        highlighted_item_id={sessionManageHighlightedMessageId}
                         items={sessionManagePreviewItems}
                         empty_text="当前会话暂无预览消息"
                         on_reach_bottom={
@@ -9775,6 +10193,8 @@ function App() {
                               }
                             : undefined
                         }
+                        is_favorited={isPreviewMessageFavorited}
+                        on_toggle_favorite={togglePreviewMessageFavorite}
                         on_request_full_content={loadSessionManagePreviewMessageDetail}
                       />
                     )}
@@ -10211,6 +10631,8 @@ function App() {
                   on_toggle_included={(entryId, included) =>
                     toggleSyncDialogEntryExcluded(entryId, !included)
                   }
+                  is_favorited={isPreviewMessageFavorited}
+                  on_toggle_favorite={togglePreviewMessageFavorite}
                   on_request_full_content={loadSyncDialogPreviewMessageDetail}
                 />
               </>
@@ -10269,6 +10691,7 @@ function App() {
                   user_avatar_src={userAvatarSrc}
                   assistant_avatar_src={assistantAvatarSrc}
                   scroll_command={sessionManagePreviewScrollCommand}
+                  highlighted_item_id={sessionManageHighlightedMessageId}
                   items={sessionManagePreviewItems}
                   empty_text={previewOverlayEmptyText}
                   on_reach_bottom={
@@ -10289,6 +10712,8 @@ function App() {
                         }
                       : undefined
                   }
+                  is_favorited={isPreviewMessageFavorited}
+                  on_toggle_favorite={togglePreviewMessageFavorite}
                   on_request_full_content={loadSessionManagePreviewMessageDetail}
                 />
               )}
@@ -10320,6 +10745,8 @@ function App() {
                   on_toggle_included={(entryId, included) =>
                     toggleSyncDialogEntryExcluded(entryId, !included)
                   }
+                  is_favorited={isPreviewMessageFavorited}
+                  on_toggle_favorite={togglePreviewMessageFavorite}
                   on_request_full_content={loadSyncDialogPreviewMessageDetail}
                 />
               )}

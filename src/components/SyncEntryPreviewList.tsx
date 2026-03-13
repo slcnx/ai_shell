@@ -1,6 +1,9 @@
 ﻿import {
+  CopyOutlined,
   MessageOutlined,
   RobotOutlined,
+  StarFilled,
+  StarOutlined,
   UserOutlined
 } from "@ant-design/icons";
 import {
@@ -27,7 +30,7 @@ import {
 import { openUrl } from "@tauri-apps/plugin-opener";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import VirtualList from "rc-virtual-list";
+import VirtualList, { type ListRef } from "rc-virtual-list";
 
 const DEFAULT_LIST_HEIGHT = 220;
 const MIN_LIST_HEIGHT = 1;
@@ -74,11 +77,24 @@ export type SyncEntryPreviewItem = {
   id: string;
   kind: "input" | "output" | string;
   content: string;
+  created_at?: number;
   created_at_text: string;
   sid_text: string;
   included: boolean;
   preview_truncated?: boolean;
+  favorite_target?: SyncEntryPreviewFavoriteTarget;
 };
+
+export type SyncEntryPreviewFavoriteTarget = {
+  pane_id: string;
+  pane_title?: string;
+  provider?: string;
+  session_id: string;
+};
+
+export type SyncEntryPreviewScrollCommand =
+  | { target: "top" | "bottom"; nonce: number }
+  | { target: "item"; item_id: string; nonce: number };
 
 export type SyncEntryPreviewFullContentResult = {
   content: string;
@@ -98,10 +114,17 @@ type SyncEntryPreviewListProps = {
   on_follow_bottom_change?: (following: boolean) => void;
   on_reach_top?: () => void;
   on_reach_bottom?: () => void;
-  scroll_command?: { target: "top" | "bottom"; nonce: number } | null;
+  scroll_command?: SyncEntryPreviewScrollCommand | null;
   on_request_full_content?: (
     item: SyncEntryPreviewItem
   ) => Promise<SyncEntryPreviewFullContentResult>;
+  is_favorited?: (item: SyncEntryPreviewItem) => boolean;
+  on_toggle_favorite?: (
+    item: SyncEntryPreviewItem,
+    next_favorited: boolean,
+    resolved_detail?: SyncEntryPreviewFullContentResult | null
+  ) => Promise<void> | void;
+  highlighted_item_id?: string;
 };
 
 type RoleMeta = {
@@ -132,6 +155,34 @@ type FullContentModalState = {
   item: SyncEntryPreviewItem | null;
   result: SyncEntryPreviewFullContentResult | null;
 };
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  if (typeof document === "undefined") {
+    throw new Error("clipboard is unavailable");
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  const copied = document.execCommand("copy");
+  document.body.removeChild(textarea);
+
+  if (!copied) {
+    throw new Error("clipboard copy failed");
+  }
+}
 
 function resolveRoleMeta(kind: string): RoleMeta {
   if (kind === "input") {
@@ -257,17 +308,25 @@ function SyncEntryPreviewList({
   on_reach_top,
   on_reach_bottom,
   scroll_command,
-  on_request_full_content
+  on_request_full_content,
+  is_favorited,
+  on_toggle_favorite,
+  highlighted_item_id
 }: SyncEntryPreviewListProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const holderRef = useRef<HTMLDivElement | null>(null);
+  const listRef = useRef<ListRef | null>(null);
   const shouldFollowBottomRef = useRef(true);
   const userScrollTriggeredRef = useRef(false);
   const lastReachTopHeightRef = useRef(0);
   const lastReachBottomHeightRef = useRef(0);
   const detailCacheRef = useRef<Map<string, SyncEntryPreviewFullContentResult>>(new Map());
+  const copiedResetTimerRef = useRef<number | null>(null);
   const [listHeight, setListHeight] = useState(DEFAULT_LIST_HEIGHT);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
+  const [copyingIds, setCopyingIds] = useState<Set<string>>(() => new Set());
+  const [favoriteLoadingIds, setFavoriteLoadingIds] = useState<Set<string>>(() => new Set());
+  const [copiedId, setCopiedId] = useState("");
   const [detailModal, setDetailModal] = useState<FullContentModalState>({
     open: false,
     loading: false,
@@ -465,6 +524,14 @@ function SyncEntryPreviewList({
   }, [items.length]);
 
   useEffect(() => {
+    return () => {
+      if (copiedResetTimerRef.current !== null) {
+        window.clearTimeout(copiedResetTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!scroll_command) {
       return;
     }
@@ -475,6 +542,15 @@ function SyncEntryPreviewList({
     }
 
     const rafId = window.requestAnimationFrame(() => {
+      if (scroll_command.target === "item") {
+        listRef.current?.scrollTo({
+          key: scroll_command.item_id,
+          align: "auto",
+          offset: -64
+        });
+        return;
+      }
+
       if (scroll_command.target === "top") {
         holder.scrollTop = 0;
         shouldFollowBottomRef.current = false;
@@ -551,6 +627,87 @@ function SyncEntryPreviewList({
     }
   };
 
+  const ensureFullContent = async (item: SyncEntryPreviewItem) => {
+    if (!item.preview_truncated || !on_request_full_content) {
+      return null;
+    }
+
+    const cached = detailCacheRef.current.get(item.id);
+    if (cached) {
+      return cached;
+    }
+
+    const result = await on_request_full_content(item);
+    detailCacheRef.current.set(item.id, result);
+    return result;
+  };
+
+  const markCopied = (entryId: string) => {
+    setCopiedId(entryId);
+    if (copiedResetTimerRef.current !== null) {
+      window.clearTimeout(copiedResetTimerRef.current);
+    }
+    copiedResetTimerRef.current = window.setTimeout(() => {
+      setCopiedId((current) => (current === entryId ? "" : current));
+      copiedResetTimerRef.current = null;
+    }, 1600);
+  };
+
+  const handleCopy = async (item: SyncEntryPreviewItem) => {
+    if (!item.content.trim()) {
+      return;
+    }
+
+    setCopyingIds((current) => {
+      const next = new Set(current);
+      next.add(item.id);
+      return next;
+    });
+
+    try {
+      let nextContent = item.content;
+      const resolvedDetail = await ensureFullContent(item);
+      if (resolvedDetail) {
+        nextContent = resolvedDetail.content;
+      }
+      await copyTextToClipboard(nextContent);
+      markCopied(item.id);
+    } catch (error) {
+      console.error("Failed to copy preview content", error);
+    } finally {
+      setCopyingIds((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
+    }
+  };
+
+  const handleToggleFavorite = async (item: SyncEntryPreviewItem, nextFavorited: boolean) => {
+    if (!on_toggle_favorite || !item.favorite_target) {
+      return;
+    }
+
+    setFavoriteLoadingIds((current) => {
+      const next = new Set(current);
+      next.add(item.id);
+      return next;
+    });
+
+    try {
+      const resolvedDetail = nextFavorited ? await ensureFullContent(item) : null;
+      await on_toggle_favorite(item, nextFavorited, resolvedDetail);
+    } catch (error) {
+      console.error("Failed to toggle favorite preview content", error);
+    } finally {
+      setFavoriteLoadingIds((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
+    }
+  };
+
   const detailItem = detailModal.item;
   const detailResult = detailModal.result;
   const detailRole = resolveRoleMeta(detailResult?.kind || detailItem?.kind || "output");
@@ -565,6 +722,7 @@ function SyncEntryPreviewList({
         ) : (
           <List className="sync-preview-list" split={false}>
             <VirtualList<PreviewListRow>
+              ref={listRef}
               data={rows}
               height={listHeight}
               itemHeight={MIN_ITEM_HEIGHT}
@@ -592,6 +750,19 @@ function SyncEntryPreviewList({
                 };
                 const expandable = isExpandable(item.content);
                 const expanded = expandable && expandedIds.has(item.id);
+                const hasCopyableContent = Boolean(item.content.trim());
+                const canOpenDetailModal = Boolean(item.preview_truncated && on_request_full_content);
+                const canFavorite = Boolean(item.favorite_target && on_toggle_favorite);
+                const showActions =
+                  expandable
+                  || item.preview_truncated
+                  || canOpenDetailModal
+                  || hasCopyableContent
+                  || canFavorite;
+                const copyLoading = copyingIds.has(item.id);
+                const copied = copiedId === item.id;
+                const favorited = is_favorited?.(item) ?? false;
+                const favoriteLoading = favoriteLoadingIds.has(item.id);
 
                 return (
                   <List.Item
@@ -599,10 +770,12 @@ function SyncEntryPreviewList({
                     className={[
                       "sync-preview-item",
                       `sync-preview-item-${role.tone}`,
+                      highlighted_item_id === item.id ? "is-highlighted" : "",
                       show_checkbox && !item.included ? "excluded" : ""
                     ]
                       .filter(Boolean)
                       .join(" ")}
+                    data-preview-entry-id={encodeURIComponent(item.id)}
                     onClick={() => {
                       if (!show_checkbox) {
                         return;
@@ -649,7 +822,7 @@ function SyncEntryPreviewList({
                           <Typography.Text type="secondary">-</Typography.Text>
                         )}
 
-                        {expandable || item.preview_truncated || on_request_full_content ? (
+                        {showActions ? (
                           <div className="sync-preview-actions">
                             {expandable ? (
                               <Button
@@ -671,7 +844,7 @@ function SyncEntryPreviewList({
                               </Tag>
                             ) : null}
 
-                            {on_request_full_content ? (
+                            {canOpenDetailModal ? (
                               <Button
                                 type="link"
                                 size="small"
@@ -682,6 +855,38 @@ function SyncEntryPreviewList({
                                 }}
                               >
                                 弹窗查看完整内容
+                              </Button>
+                            ) : null}
+
+                            {hasCopyableContent ? (
+                              <Button
+                                type="link"
+                                size="small"
+                                className="sync-preview-copy-btn"
+                                icon={<CopyOutlined />}
+                                loading={copyLoading}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void handleCopy(item);
+                                }}
+                              >
+                                {copied ? "已复制" : "复制"}
+                              </Button>
+                            ) : null}
+
+                            {canFavorite ? (
+                              <Button
+                                type="link"
+                                size="small"
+                                className="sync-preview-favorite-btn"
+                                icon={favorited ? <StarFilled /> : <StarOutlined />}
+                                loading={favoriteLoading}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void handleToggleFavorite(item, !favorited);
+                                }}
+                              >
+                                {favorited ? "已收藏" : "收藏"}
                               </Button>
                             ) : null}
                           </div>

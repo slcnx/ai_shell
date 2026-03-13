@@ -1,6 +1,7 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod ai_team_mcp;
+mod collab_workbench;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -225,6 +226,33 @@ struct NativeSessionPreviewResponse {
 struct NativeSessionMessageDetailResponse {
     message_id: String,
     session_id: String,
+    kind: String,
+    content: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct FavoriteMessageRecord {
+    id: String,
+    pane_id: String,
+    pane_title: String,
+    provider: String,
+    session_id: String,
+    message_id: String,
+    kind: String,
+    content: String,
+    created_at: i64,
+    favorited_at: i64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FavoriteMessageUpsertInput {
+    pane_id: String,
+    pane_title: String,
+    provider: String,
+    session_id: String,
+    message_id: String,
     kind: String,
     content: String,
     created_at: i64,
@@ -761,6 +789,25 @@ fn init_schema(path: &Path) -> Result<()> {
           file_glob TEXT NOT NULL DEFAULT '',
           updated_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS favorite_messages (
+          id TEXT PRIMARY KEY,
+          pane_id TEXT NOT NULL,
+          pane_title TEXT NOT NULL DEFAULT '',
+          provider TEXT NOT NULL DEFAULT '',
+          session_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT '',
+          content TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL DEFAULT 0,
+          favorited_at INTEGER NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_favorite_messages_target
+          ON favorite_messages(pane_id, session_id, message_id);
+
+        CREATE INDEX IF NOT EXISTS idx_favorite_messages_favorited_at
+          ON favorite_messages(favorited_at DESC);
         "#,
     )?;
 
@@ -5318,6 +5365,153 @@ fn upsert_pane_session_state_db(
     load_pane_session_state_db(path, pane_id)
 }
 
+fn row_to_favorite_message_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FavoriteMessageRecord> {
+    Ok(FavoriteMessageRecord {
+        id: row.get::<usize, String>(0)?,
+        pane_id: row.get::<usize, String>(1)?,
+        pane_title: row.get::<usize, String>(2)?,
+        provider: row.get::<usize, String>(3)?,
+        session_id: row.get::<usize, String>(4)?,
+        message_id: row.get::<usize, String>(5)?,
+        kind: row.get::<usize, String>(6)?,
+        content: row.get::<usize, String>(7)?,
+        created_at: row.get::<usize, i64>(8)?,
+        favorited_at: row.get::<usize, i64>(9)?,
+    })
+}
+
+fn list_favorite_messages_db(path: &Path) -> Result<Vec<FavoriteMessageRecord>> {
+    let connection = open_db(path)?;
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+          id,
+          pane_id,
+          pane_title,
+          provider,
+          session_id,
+          message_id,
+          kind,
+          content,
+          created_at,
+          favorited_at
+        FROM favorite_messages
+        ORDER BY favorited_at DESC, created_at DESC, id DESC
+        "#,
+    )?;
+    let rows = statement.query_map([], row_to_favorite_message_record)?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
+    }
+    Ok(items)
+}
+
+fn find_favorite_message_by_target_db(
+    connection: &Connection,
+    pane_id: &str,
+    session_id: &str,
+    message_id: &str,
+) -> Result<Option<FavoriteMessageRecord>> {
+    connection
+        .query_row(
+            r#"
+            SELECT
+              id,
+              pane_id,
+              pane_title,
+              provider,
+              session_id,
+              message_id,
+              kind,
+              content,
+              created_at,
+              favorited_at
+            FROM favorite_messages
+            WHERE pane_id = ?1 AND session_id = ?2 AND message_id = ?3
+            "#,
+            params![pane_id, session_id, message_id],
+            row_to_favorite_message_record,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn upsert_favorite_message_db(
+    path: &Path,
+    input: FavoriteMessageUpsertInput,
+) -> Result<FavoriteMessageRecord> {
+    let pane_id = input.pane_id.trim().to_string();
+    let session_id = input.session_id.trim().to_string();
+    let message_id = input.message_id.trim().to_string();
+    if pane_id.is_empty() {
+        return Err(anyhow!("pane_id is empty"));
+    }
+    if session_id.is_empty() {
+        return Err(anyhow!("session_id is empty"));
+    }
+    if message_id.is_empty() {
+        return Err(anyhow!("message_id is empty"));
+    }
+
+    let pane_title = input.pane_title.trim().to_string();
+    let provider = input.provider.trim().to_string();
+    let kind = input.kind.trim().to_string();
+    let content = input.content.trim().to_string();
+    let created_at = input.created_at.max(0);
+    let favorited_at = now_epoch();
+
+    let connection = open_db(path)?;
+    let favorite_id = find_favorite_message_by_target_db(&connection, &pane_id, &session_id, &message_id)?
+        .map(|item| item.id)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    connection.execute(
+        r#"
+        INSERT INTO favorite_messages
+          (id, pane_id, pane_title, provider, session_id, message_id, kind, content, created_at, favorited_at)
+        VALUES
+          (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(pane_id, session_id, message_id)
+        DO UPDATE SET
+          id = excluded.id,
+          pane_title = excluded.pane_title,
+          provider = excluded.provider,
+          kind = excluded.kind,
+          content = excluded.content,
+          created_at = excluded.created_at,
+          favorited_at = excluded.favorited_at
+        "#,
+        params![
+            favorite_id,
+            pane_id,
+            pane_title,
+            provider,
+            session_id,
+            message_id,
+            kind,
+            content,
+            created_at,
+            favorited_at
+        ],
+    )?;
+
+    find_favorite_message_by_target_db(&connection, &pane_id, &session_id, &message_id)?
+        .ok_or_else(|| anyhow!("favorite message not found after upsert"))
+}
+
+fn delete_favorite_message_db(path: &Path, favorite_id: &str) -> Result<()> {
+    let normalized_id = favorite_id.trim();
+    if normalized_id.is_empty() {
+        return Err(anyhow!("favorite_id is empty"));
+    }
+    let connection = open_db(path)?;
+    connection.execute(
+        "DELETE FROM favorite_messages WHERE id = ?1",
+        params![normalized_id],
+    )?;
+    Ok(())
+}
+
 fn save_bound_session_id(connection: &Connection, pane_id: &str, session_id: &str) -> Result<()> {
     connection.execute(
         r#"
@@ -7190,6 +7384,24 @@ fn get_native_session_message_details(
 }
 
 #[tauri::command]
+fn list_favorite_messages(state: State<AppState>) -> Result<Vec<FavoriteMessageRecord>, String> {
+    list_favorite_messages_db(&state.db_path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn upsert_favorite_message(
+    state: State<AppState>,
+    payload: FavoriteMessageUpsertInput,
+) -> Result<FavoriteMessageRecord, String> {
+    upsert_favorite_message_db(&state.db_path, payload).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_favorite_message(state: State<AppState>, favorite_id: String) -> Result<(), String> {
+    delete_favorite_message_db(&state.db_path, &favorite_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn sync_native_session_messages(
     state: State<AppState>,
     target_pane_id: String,
@@ -8299,6 +8511,9 @@ fn main() {
             preview_native_session_messages,
             get_native_session_message_detail,
             get_native_session_message_details,
+            list_favorite_messages,
+            upsert_favorite_message,
+            delete_favorite_message,
             sync_native_session_messages,
             preview_native_unrecognized_file,
             list_native_unrecognized_files,
@@ -8342,6 +8557,23 @@ fn main() {
             ai_team_mcp::ai_team_is_conversation_finished,
             ai_team_mcp::ai_team_submit_requirement,
             ai_team_mcp::ai_team_execute_next,
+            collab_workbench::collab_list_role_templates,
+            collab_workbench::collab_create_workbench,
+            collab_workbench::collab_get_snapshot,
+            collab_workbench::collab_initialize_roles,
+            collab_workbench::collab_add_role,
+            collab_workbench::collab_remove_role,
+            collab_workbench::collab_set_role_sid,
+            collab_workbench::collab_clear_role_sid,
+            collab_workbench::collab_send_role_message,
+            collab_workbench::collab_load_role_conversation,
+            collab_workbench::collab_create_run,
+            collab_workbench::collab_create_task_card,
+            collab_workbench::collab_dispatch_task_card,
+            collab_workbench::collab_collect_role_reply,
+            collab_workbench::collab_accept_reply,
+            collab_workbench::collab_reject_reply,
+            collab_workbench::collab_complete_run,
             clear_all_history,
             clear_pane_history
         ])
