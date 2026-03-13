@@ -42,6 +42,26 @@ export type CollabCreateTaskCardResponse = {
   task: CollabTaskCardSnapshot;
 };
 
+export type CollabAutoPlanResponse = {
+  snapshot: CollabWorkbenchSnapshot;
+  created_task_ids: string[];
+  artifact: CollabArtifactSnapshot | null;
+};
+
+export type CollabDispatchWaveResponse = {
+  snapshot: CollabWorkbenchSnapshot;
+  dispatched_task_ids: string[];
+  wave_index: number;
+};
+
+export type CollabAutoValidateWaveResponse = {
+  snapshot: CollabWorkbenchSnapshot;
+  accepted_task_ids: string[];
+  rejected_task_ids: string[];
+  waiting_task_ids: string[];
+  wave_index: number;
+};
+
 export type CollabDispatchTaskCardResponse = {
   snapshot: CollabWorkbenchSnapshot;
   task: CollabTaskCardSnapshot;
@@ -161,6 +181,28 @@ export async function collabCreateTaskCard(input: {
   expectedOutput?: string;
 }) {
   return invoke<CollabCreateTaskCardResponse>("collab_create_task_card", input);
+}
+
+export async function collabAutoPlanRun(workbenchId: string, runId: string) {
+  return invoke<CollabAutoPlanResponse>("collab_auto_plan_run", {
+    workbenchId,
+    runId,
+  });
+}
+
+export async function collabDispatchReadyWave(workbenchId: string, runId: string) {
+  return invoke<CollabDispatchWaveResponse>("collab_dispatch_ready_wave", {
+    workbenchId,
+    runId,
+  });
+}
+
+export async function collabAutoValidateWave(workbenchId: string, runId: string, idleThresholdSecs = 5) {
+  return invoke<CollabAutoValidateWaveResponse>("collab_auto_validate_wave", {
+    workbenchId,
+    runId,
+    idleThresholdSecs,
+  });
 }
 
 export async function collabDispatchTaskCard(workbenchId: string, taskId: string) {

@@ -110,6 +110,12 @@ pub(crate) struct CollabTaskCardSnapshot {
     latest_reply_summary: Option<String>,
     latest_artifact_id: Option<String>,
     last_error: Option<String>,
+    dependency_task_ids: Vec<String>,
+    wave_index: i64,
+    plan_order: i64,
+    auto_generated: bool,
+    validation_summary: Option<String>,
+    validation_checked_at: i64,
     created_at: i64,
     dispatched_at: i64,
     replied_at: i64,
@@ -225,6 +231,29 @@ pub(crate) struct CollabCompleteRunResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct CollabAutoPlanResponse {
+    snapshot: CollabWorkbenchSnapshotResponse,
+    created_task_ids: Vec<String>,
+    artifact: Option<CollabArtifactSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CollabDispatchWaveResponse {
+    snapshot: CollabWorkbenchSnapshotResponse,
+    dispatched_task_ids: Vec<String>,
+    wave_index: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CollabAutoValidateWaveResponse {
+    snapshot: CollabWorkbenchSnapshotResponse,
+    accepted_task_ids: Vec<String>,
+    rejected_task_ids: Vec<String>,
+    waiting_task_ids: Vec<String>,
+    wave_index: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct CollabSendMessageResponse {
     accepted: bool,
     pane_id: String,
@@ -311,11 +340,35 @@ struct CollabTaskCardRow {
     latest_reply_summary: Option<String>,
     latest_artifact_id: Option<String>,
     last_error: Option<String>,
+    dependency_task_ids_json: String,
+    wave_index: i64,
+    plan_order: i64,
+    auto_generated: bool,
+    validation_summary: Option<String>,
+    validation_checked_at: i64,
     created_at: i64,
     dispatched_at: i64,
     replied_at: i64,
     resolved_at: i64,
     updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CollabPlanTaskEnvelope {
+    key: String,
+    role_key: String,
+    title: String,
+    goal: String,
+    dependencies: Option<Vec<String>>,
+    constraints_text: Option<String>,
+    input_summary: Option<String>,
+    expected_output: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CollabPlanEnvelope {
+    summary: String,
+    tasks: Vec<CollabPlanTaskEnvelope>,
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +509,12 @@ fn ensure_collab_schema(path: &Path) -> Result<(), String> {
               latest_reply_summary TEXT,
               latest_artifact_id TEXT,
               last_error TEXT,
+              dependency_task_ids_json TEXT NOT NULL DEFAULT '[]',
+              wave_index INTEGER NOT NULL DEFAULT 0,
+              plan_order INTEGER NOT NULL DEFAULT 0,
+              auto_generated INTEGER NOT NULL DEFAULT 0,
+              validation_summary TEXT,
+              validation_checked_at INTEGER NOT NULL DEFAULT 0,
               created_at INTEGER NOT NULL,
               dispatched_at INTEGER NOT NULL DEFAULT 0,
               replied_at INTEGER NOT NULL DEFAULT 0,
@@ -503,6 +562,21 @@ fn ensure_collab_schema(path: &Path) -> Result<(), String> {
             "#,
         )
         .map_err(|error| error.to_string())?;
+    for sql in [
+        "ALTER TABLE collab_task_cards ADD COLUMN dependency_task_ids_json TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE collab_task_cards ADD COLUMN wave_index INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE collab_task_cards ADD COLUMN plan_order INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE collab_task_cards ADD COLUMN auto_generated INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE collab_task_cards ADD COLUMN validation_summary TEXT",
+        "ALTER TABLE collab_task_cards ADD COLUMN validation_checked_at INTEGER NOT NULL DEFAULT 0",
+    ] {
+        if let Err(error) = connection.execute(sql, []) {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(message);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -996,6 +1070,12 @@ fn build_collab_task_snapshot(row: &CollabTaskCardRow) -> CollabTaskCardSnapshot
         latest_reply_summary: row.latest_reply_summary.clone(),
         latest_artifact_id: row.latest_artifact_id.clone(),
         last_error: row.last_error.clone(),
+        dependency_task_ids: deserialize_json_or_default(&row.dependency_task_ids_json),
+        wave_index: row.wave_index,
+        plan_order: row.plan_order,
+        auto_generated: row.auto_generated,
+        validation_summary: row.validation_summary.clone(),
+        validation_checked_at: row.validation_checked_at,
         created_at: row.created_at,
         dispatched_at: row.dispatched_at,
         replied_at: row.replied_at,
@@ -1466,9 +1546,9 @@ fn save_collab_task_db(path: &Path, row: &CollabTaskCardRow) -> Result<(), Strin
         .execute(
             r#"
             INSERT INTO collab_task_cards
-              (task_id, workbench_id, run_id, source_role_id, target_role_id, title, goal, constraints_text, input_summary, expected_output, status, latest_reply_summary, latest_artifact_id, last_error, created_at, dispatched_at, replied_at, resolved_at, updated_at)
+              (task_id, workbench_id, run_id, source_role_id, target_role_id, title, goal, constraints_text, input_summary, expected_output, status, latest_reply_summary, latest_artifact_id, last_error, dependency_task_ids_json, wave_index, plan_order, auto_generated, validation_summary, validation_checked_at, created_at, dispatched_at, replied_at, resolved_at, updated_at)
             VALUES
-              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             ON CONFLICT(task_id)
             DO UPDATE SET
               source_role_id = excluded.source_role_id,
@@ -1482,6 +1562,12 @@ fn save_collab_task_db(path: &Path, row: &CollabTaskCardRow) -> Result<(), Strin
               latest_reply_summary = excluded.latest_reply_summary,
               latest_artifact_id = excluded.latest_artifact_id,
               last_error = excluded.last_error,
+              dependency_task_ids_json = excluded.dependency_task_ids_json,
+              wave_index = excluded.wave_index,
+              plan_order = excluded.plan_order,
+              auto_generated = excluded.auto_generated,
+              validation_summary = excluded.validation_summary,
+              validation_checked_at = excluded.validation_checked_at,
               dispatched_at = excluded.dispatched_at,
               replied_at = excluded.replied_at,
               resolved_at = excluded.resolved_at,
@@ -1502,6 +1588,12 @@ fn save_collab_task_db(path: &Path, row: &CollabTaskCardRow) -> Result<(), Strin
                 row.latest_reply_summary,
                 row.latest_artifact_id,
                 row.last_error,
+                row.dependency_task_ids_json,
+                row.wave_index,
+                row.plan_order,
+                row.auto_generated,
+                row.validation_summary,
+                row.validation_checked_at,
                 row.created_at,
                 row.dispatched_at,
                 row.replied_at,
@@ -1518,7 +1610,7 @@ fn load_collab_task_row_db(path: &Path, task_id: &str) -> Result<CollabTaskCardR
     connection
         .query_row(
             r#"
-            SELECT task_id, workbench_id, run_id, source_role_id, target_role_id, title, goal, constraints_text, input_summary, expected_output, status, latest_reply_summary, latest_artifact_id, last_error, created_at, dispatched_at, replied_at, resolved_at, updated_at
+            SELECT task_id, workbench_id, run_id, source_role_id, target_role_id, title, goal, constraints_text, input_summary, expected_output, status, latest_reply_summary, latest_artifact_id, last_error, dependency_task_ids_json, wave_index, plan_order, auto_generated, validation_summary, validation_checked_at, created_at, dispatched_at, replied_at, resolved_at, updated_at
             FROM collab_task_cards
             WHERE task_id = ?1
             "#,
@@ -1539,11 +1631,17 @@ fn load_collab_task_row_db(path: &Path, task_id: &str) -> Result<CollabTaskCardR
                     latest_reply_summary: row.get(11)?,
                     latest_artifact_id: row.get(12)?,
                     last_error: row.get(13)?,
-                    created_at: row.get(14)?,
-                    dispatched_at: row.get(15)?,
-                    replied_at: row.get(16)?,
-                    resolved_at: row.get(17)?,
-                    updated_at: row.get(18)?,
+                    dependency_task_ids_json: row.get(14)?,
+                    wave_index: row.get(15)?,
+                    plan_order: row.get(16)?,
+                    auto_generated: row.get(17)?,
+                    validation_summary: row.get(18)?,
+                    validation_checked_at: row.get(19)?,
+                    created_at: row.get(20)?,
+                    dispatched_at: row.get(21)?,
+                    replied_at: row.get(22)?,
+                    resolved_at: row.get(23)?,
+                    updated_at: row.get(24)?,
                 })
             },
         )
@@ -1555,10 +1653,10 @@ fn list_collab_task_rows_for_run_db(path: &Path, run_id: &str) -> Result<Vec<Col
     let mut stmt = connection
         .prepare(
             r#"
-            SELECT task_id, workbench_id, run_id, source_role_id, target_role_id, title, goal, constraints_text, input_summary, expected_output, status, latest_reply_summary, latest_artifact_id, last_error, created_at, dispatched_at, replied_at, resolved_at, updated_at
+            SELECT task_id, workbench_id, run_id, source_role_id, target_role_id, title, goal, constraints_text, input_summary, expected_output, status, latest_reply_summary, latest_artifact_id, last_error, dependency_task_ids_json, wave_index, plan_order, auto_generated, validation_summary, validation_checked_at, created_at, dispatched_at, replied_at, resolved_at, updated_at
             FROM collab_task_cards
             WHERE run_id = ?1
-            ORDER BY updated_at DESC, created_at DESC, rowid DESC
+            ORDER BY wave_index ASC, plan_order ASC, updated_at DESC, created_at DESC, rowid DESC
             "#,
         )
         .map_err(|error| error.to_string())?;
@@ -1579,11 +1677,17 @@ fn list_collab_task_rows_for_run_db(path: &Path, run_id: &str) -> Result<Vec<Col
                 latest_reply_summary: row.get(11)?,
                 latest_artifact_id: row.get(12)?,
                 last_error: row.get(13)?,
-                created_at: row.get(14)?,
-                dispatched_at: row.get(15)?,
-                replied_at: row.get(16)?,
-                resolved_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                dependency_task_ids_json: row.get(14)?,
+                wave_index: row.get(15)?,
+                plan_order: row.get(16)?,
+                auto_generated: row.get(17)?,
+                validation_summary: row.get(18)?,
+                validation_checked_at: row.get(19)?,
+                created_at: row.get(20)?,
+                dispatched_at: row.get(21)?,
+                replied_at: row.get(22)?,
+                resolved_at: row.get(23)?,
+                updated_at: row.get(24)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -1962,6 +2066,10 @@ fn extract_collab_reply_block(content: &str) -> Option<CollabReplyEnvelope> {
     extract_json_block(content, "<collab_reply>", "</collab_reply>")
 }
 
+fn extract_collab_plan_block(content: &str) -> Option<CollabPlanEnvelope> {
+    extract_json_block(content, "<collab_plan>", "</collab_plan>")
+}
+
 fn summarize_reply_content(content: &str, envelope: Option<&CollabReplyEnvelope>) -> String {
     let summary = envelope
         .map(|item| item.summary.trim().to_string())
@@ -1973,6 +2081,358 @@ fn summarize_reply_content(content: &str, envelope: Option<&CollabReplyEnvelope>
     } else {
         compact.chars().take(220).collect::<String>() + "..."
     }
+}
+
+fn build_collab_plan_prompt(
+    workbench: &CollabWorkbenchRow,
+    run: &CollabRunRow,
+    roles: &[CollabRoleRow],
+) -> String {
+    let role_lines = roles
+        .iter()
+        .map(|role| {
+            format!(
+                "- role_key: {} | template: {} | name: {} | provider: {}",
+                role.role_key, role.template_key, role.name, role.provider
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    [
+        "你是当前协作工作台的 Planner。请把本次 Run 拆解成一个可执行 DAG 计划。".to_string(),
+        format!("项目目录: {}", workbench.project_directory),
+        format!("Run 标题: {}", run.title),
+        format!("Run 目标:\n{}", run.goal.trim()),
+        "可用角色如下，请只使用这些 role_key：".to_string(),
+        role_lines,
+        "要求：".to_string(),
+        "1. 输出 2-8 个任务，形成无环依赖图。".to_string(),
+        "2. 每个任务必须分配给一个 role_key。".to_string(),
+        "3. 能并行的任务放在同一波，不要制造无意义依赖。".to_string(),
+        "4. 如果有 reviewer 角色，最后一波应包含评审/验收任务。".to_string(),
+        "5. 只输出一个结构化 JSON 块，不要输出额外解释。".to_string(),
+        "输出格式：".to_string(),
+        "<collab_plan>{\"summary\":\"计划摘要\",\"tasks\":[{\"key\":\"task_api\",\"role_key\":\"implementer\",\"title\":\"实现 API\",\"goal\":\"...\",\"dependencies\":[\"task_spec\"],\"constraints_text\":\"\",\"input_summary\":\"\",\"expected_output\":\"...\"}]}</collab_plan>".to_string(),
+    ]
+    .join("\n\n")
+}
+
+fn normalize_plan_task_key(raw: &str, fallback_index: usize) -> String {
+    let normalized = normalize_role_key_candidate(raw);
+    if normalized.is_empty() {
+        format!("task_{}", fallback_index + 1)
+    } else {
+        normalized
+    }
+}
+
+fn normalize_dependency_keys(values: Option<&Vec<String>>, current_key: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::<String>::new();
+    values
+        .into_iter()
+        .flat_map(|items| items.iter())
+        .map(|item| normalize_role_key_candidate(item))
+        .filter(|item| !item.is_empty() && item != current_key)
+        .filter(|item| seen.insert(item.clone()))
+        .collect::<Vec<_>>()
+}
+
+fn find_collab_role_for_plan<'a>(
+    roles: &'a [CollabRoleRow],
+    role_key: &str,
+) -> Option<&'a CollabRoleRow> {
+    let normalized = normalize_role_key_candidate(role_key);
+    if normalized.is_empty() {
+        return None;
+    }
+    roles.iter()
+        .find(|role| role.role_key.trim().eq_ignore_ascii_case(&normalized))
+        .or_else(|| {
+            roles
+                .iter()
+                .find(|role| role.template_key.trim().eq_ignore_ascii_case(role_key.trim()))
+        })
+}
+
+fn compute_plan_wave_map(tasks: &[(String, Vec<String>)]) -> Result<std::collections::HashMap<String, i64>, String> {
+    fn visit(
+        key: &str,
+        adjacency: &std::collections::HashMap<String, Vec<String>>,
+        temp: &mut std::collections::HashSet<String>,
+        memo: &mut std::collections::HashMap<String, i64>,
+    ) -> Result<i64, String> {
+        if let Some(value) = memo.get(key) {
+            return Ok(*value);
+        }
+        if !temp.insert(key.to_string()) {
+            return Err(format!("plan has cyclic dependency around {}", key));
+        }
+        let mut wave = 0_i64;
+        for dependency in adjacency.get(key).cloned().unwrap_or_default() {
+            if !adjacency.contains_key(&dependency) {
+                return Err(format!("plan dependency {} does not exist", dependency));
+            }
+            wave = wave.max(visit(&dependency, adjacency, temp, memo)? + 1);
+        }
+        temp.remove(key);
+        memo.insert(key.to_string(), wave);
+        Ok(wave)
+    }
+
+    let adjacency = tasks
+        .iter()
+        .map(|(key, dependencies)| (key.clone(), dependencies.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut memo = std::collections::HashMap::<String, i64>::new();
+    let mut temp = std::collections::HashSet::<String>::new();
+    for key in adjacency.keys() {
+        let _ = visit(key, &adjacency, &mut temp, &mut memo)?;
+    }
+    Ok(memo)
+}
+
+fn collab_task_is_terminal(status: CollabTaskStatus) -> bool {
+    matches!(
+        status,
+        CollabTaskStatus::Accepted | CollabTaskStatus::Rejected | CollabTaskStatus::Cancelled
+    )
+}
+
+fn collab_task_dependencies_accepted(
+    task: &CollabTaskCardRow,
+    task_map: &std::collections::HashMap<String, CollabTaskCardRow>,
+) -> bool {
+    let dependency_ids = deserialize_json_or_default::<Vec<String>>(&task.dependency_task_ids_json);
+    dependency_ids.into_iter().all(|dependency_id| {
+        task_map
+            .get(&dependency_id)
+            .map(|dependency| normalize_collab_task_status(&dependency.status) == CollabTaskStatus::Accepted)
+            .unwrap_or(false)
+    })
+}
+
+fn invalidate_collab_role_preview_cache(state: &AppState, role: &CollabRoleRow) {
+    invalidate_native_session_preview_cache(state, &role.provider);
+}
+
+fn wait_for_collab_role_completion(
+    state: &AppState,
+    role: &CollabRoleRow,
+    sent_at: i64,
+    timeout_secs: i64,
+    idle_threshold_secs: i64,
+) -> Result<CollabRoleRow, String> {
+    let started = std::time::Instant::now();
+    loop {
+        let refreshed = load_collab_role_row_db(&state.db_path, &role.workbench_id, &role.role_id)?;
+        invalidate_collab_role_preview_cache(state, &refreshed);
+        let status = compute_collab_role_status_from_row(state, &refreshed, idle_threshold_secs)?;
+        if status.completed && status.last_output_at >= sent_at {
+            return Ok(refreshed);
+        }
+        if started.elapsed().as_secs() >= timeout_secs.max(5) as u64 {
+            return Err(format!("role {} did not finish within {}s", refreshed.name, timeout_secs.max(5)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    }
+}
+
+fn dispatch_collab_task_internal(
+    state: &AppState,
+    workbench_id: &str,
+    task_id: &str,
+) -> Result<(CollabTaskCardRow, i64), String> {
+    let mut task = load_collab_task_row_db(&state.db_path, task_id)?;
+    if task.workbench_id != workbench_id {
+        return Err("task does not belong to workbench".to_string());
+    }
+    let task_status = normalize_collab_task_status(&task.status);
+    if !matches!(task_status, CollabTaskStatus::Draft | CollabTaskStatus::Queued) {
+        return Err("task is not ready to dispatch".to_string());
+    }
+    let workbench = load_collab_workbench_row_db(&state.db_path, workbench_id)?;
+    let run = load_collab_run_row_db(&state.db_path, &task.run_id)?;
+    let role = load_collab_role_row_db(&state.db_path, workbench_id, &task.target_role_id)?;
+    if role.pane_id.trim().is_empty() {
+        return Err("target role has no pane yet, please initialize roles first".to_string());
+    }
+    let session_id = resolve_collab_role_session_id(state, &role);
+    if session_id.is_empty() {
+        return Err("target role has no session id yet, please bind sid first".to_string());
+    }
+    let source_role_name = task
+        .source_role_id
+        .as_deref()
+        .and_then(|role_id| load_collab_role_row_db(&state.db_path, workbench_id, role_id).ok())
+        .map(|item| item.name)
+        .unwrap_or_else(|| "用户/工作台".to_string());
+    let prompt = build_collab_dispatch_prompt(&workbench, &run, Some(&source_role_name), &role, &task);
+    paste_to_pane_internal(state, &role.pane_id, &prompt, true).map_err(|error| error.to_string())?;
+    let sent_at = now_epoch();
+    let _ = mutate_collab_role_db(&state.db_path, workbench_id, &role.role_id, |item| {
+        item.last_sent_at = sent_at;
+        item.phase = collab_role_phase_key(CollabRolePhase::Running).to_string();
+        item.last_error = None;
+    })?;
+    task.status = collab_task_status_key(CollabTaskStatus::Dispatched).to_string();
+    task.dispatched_at = sent_at;
+    task.updated_at = sent_at;
+    task.last_error = None;
+    save_collab_task_db(&state.db_path, &task)?;
+    insert_collab_event_db(
+        &state.db_path,
+        workbench_id,
+        Some(&task.run_id),
+        Some(&task.task_id),
+        Some(&role.role_id),
+        "task_dispatched",
+        &format!("派发任务卡：{} -> {}", task.title, role.name),
+        Some(serde_json::json!({ "session_id": session_id, "sent_at": sent_at }).to_string()),
+    )?;
+    Ok((task, sent_at))
+}
+
+fn collect_collab_task_reply_internal(
+    state: &AppState,
+    workbench_id: &str,
+    task_id: &str,
+    idle_threshold_secs: i64,
+) -> Result<(CollabTaskCardRow, Option<CollabArtifactRow>, bool), String> {
+    let mut task = load_collab_task_row_db(&state.db_path, task_id)?;
+    if task.workbench_id != workbench_id {
+        return Err("task does not belong to workbench".to_string());
+    }
+    let role = load_collab_role_row_db(&state.db_path, workbench_id, &task.target_role_id)?;
+    invalidate_collab_role_preview_cache(state, &role);
+    let status = compute_collab_role_status_from_row(state, &role, idle_threshold_secs)?;
+    if !status.completed {
+        return Ok((task, None, true));
+    }
+    if normalize_collab_task_status(&task.status) == CollabTaskStatus::Replied {
+        let artifact = task
+            .latest_artifact_id
+            .as_deref()
+            .and_then(|artifact_id| load_collab_artifact_row_db(&state.db_path, artifact_id).ok());
+        return Ok((task, artifact, false));
+    }
+    if task.dispatched_at <= 0 {
+        return Err("task has not been dispatched yet".to_string());
+    }
+    let (reply_output, last_seen_at) = read_collab_role_output_since(state, &role, task.dispatched_at)?;
+    if reply_output.trim().is_empty() {
+        let updated = mutate_collab_role_db(&state.db_path, workbench_id, &role.role_id, |item| {
+            item.phase = collab_role_phase_key(CollabRolePhase::Error).to_string();
+            item.last_error = Some("no output collected for dispatched task".to_string());
+        })?;
+        task.last_error = updated.last_error.clone();
+        task.updated_at = now_epoch();
+        save_collab_task_db(&state.db_path, &task)?;
+        return Ok((task, None, false));
+    }
+    let _ = mutate_collab_role_db(&state.db_path, workbench_id, &role.role_id, |item| {
+        item.last_read_at = last_seen_at;
+        item.phase = collab_role_phase_key(CollabRolePhase::Ready).to_string();
+        item.last_error = None;
+    });
+    let reply_envelope = extract_collab_reply_block(&reply_output);
+    let summary = summarize_reply_content(&reply_output, reply_envelope.as_ref());
+    let artifact_row = CollabArtifactRow {
+        artifact_id: Uuid::new_v4().to_string(),
+        workbench_id: workbench_id.to_string(),
+        run_id: Some(task.run_id.clone()),
+        task_id: Some(task.task_id.clone()),
+        role_id: Some(role.role_id.clone()),
+        kind: "reply".to_string(),
+        title: task.title.clone(),
+        summary: summary.clone(),
+        content: reply_output.clone(),
+        pane_id: role.pane_id.clone(),
+        session_id: resolve_collab_role_session_id(state, &role),
+        created_at: now_epoch(),
+    };
+    insert_collab_artifact_db(&state.db_path, &artifact_row)?;
+    task.status = collab_task_status_key(CollabTaskStatus::Replied).to_string();
+    task.latest_reply_summary = Some(summary.clone());
+    task.latest_artifact_id = Some(artifact_row.artifact_id.clone());
+    task.last_error = None;
+    task.replied_at = artifact_row.created_at;
+    task.updated_at = artifact_row.created_at;
+    save_collab_task_db(&state.db_path, &task)?;
+    insert_collab_event_db(
+        &state.db_path,
+        workbench_id,
+        Some(&task.run_id),
+        Some(&task.task_id),
+        Some(&role.role_id),
+        "reply_collected",
+        &format!("采集回执：{} <- {}", task.title, role.name),
+        Some(
+            serde_json::json!({
+                "summary": summary,
+                "done": reply_envelope.as_ref().map(|item| item.done).unwrap_or(false),
+                "artifact_id": artifact_row.artifact_id
+            })
+            .to_string(),
+        ),
+    )?;
+    Ok((task, Some(artifact_row), false))
+}
+
+fn resolve_collab_task_internal(
+    state: &AppState,
+    workbench_id: &str,
+    task_id: &str,
+    accepted: bool,
+    note: &str,
+) -> Result<CollabTaskCardRow, String> {
+    let mut task = load_collab_task_row_db(&state.db_path, task_id)?;
+    if task.workbench_id != workbench_id {
+        return Err("task does not belong to workbench".to_string());
+    }
+    if normalize_collab_task_status(&task.status) != CollabTaskStatus::Replied {
+        return Err("task reply has not been collected yet".to_string());
+    }
+    let note_text = note.trim().to_string();
+    task.status = if accepted {
+        collab_task_status_key(CollabTaskStatus::Accepted).to_string()
+    } else {
+        collab_task_status_key(CollabTaskStatus::Rejected).to_string()
+    };
+    task.resolved_at = now_epoch();
+    task.updated_at = task.resolved_at;
+    task.validation_summary = if note_text.is_empty() {
+        None
+    } else {
+        Some(note_text.clone())
+    };
+    task.validation_checked_at = task.resolved_at;
+    task.last_error = if accepted {
+        if note_text.is_empty() {
+            None
+        } else {
+            Some(note_text.clone())
+        }
+    } else if note_text.is_empty() {
+        Some("reply rejected".to_string())
+    } else {
+        Some(note_text.clone())
+    };
+    save_collab_task_db(&state.db_path, &task)?;
+    insert_collab_event_db(
+        &state.db_path,
+        workbench_id,
+        Some(&task.run_id),
+        Some(&task.task_id),
+        Some(&task.target_role_id),
+        if accepted { "reply_accepted" } else { "reply_rejected" },
+        &format!("{}：{}", if accepted { "采纳回执" } else { "驳回回执" }, task.title),
+        if note_text.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({ "note": note_text }).to_string())
+        },
+    )?;
+    Ok(task)
 }
 
 #[tauri::command]
@@ -2381,6 +2841,12 @@ pub(crate) fn collab_create_task_card(
         latest_reply_summary: None,
         latest_artifact_id: None,
         last_error: None,
+        dependency_task_ids_json: "[]".to_string(),
+        wave_index: 0,
+        plan_order: 0,
+        auto_generated: false,
+        validation_summary: None,
+        validation_checked_at: 0,
         created_at: now,
         dispatched_at: 0,
         replied_at: 0,
@@ -2408,6 +2874,432 @@ pub(crate) fn collab_create_task_card(
     Ok(CollabCreateTaskCardResponse {
         snapshot: load_collab_snapshot_db(&state, &workbench_id)?,
         task: build_collab_task_snapshot(&row),
+    })
+}
+
+#[tauri::command]
+pub(crate) fn collab_auto_plan_run(
+    state: State<AppState>,
+    workbench_id: String,
+    run_id: String,
+) -> Result<CollabAutoPlanResponse, String> {
+    ensure_collab_schema(&state.db_path)?;
+    let workbench = load_collab_workbench_row_db(&state.db_path, &workbench_id)?;
+    let run = load_collab_run_row_db(&state.db_path, &run_id)?;
+    if run.workbench_id != workbench_id {
+        return Err("run does not belong to workbench".to_string());
+    }
+    if is_collab_run_done(normalize_collab_run_status(&run.status)) {
+        return Err("run is already closed".to_string());
+    }
+    if !list_collab_task_rows_for_run_db(&state.db_path, &run_id)?.is_empty() {
+        return Err("auto plan requires an empty task board for this run".to_string());
+    }
+    let roles = list_collab_role_rows_db(&state.db_path, &workbench_id)?;
+    let planner = roles
+        .iter()
+        .find(|role| role.template_key.trim().eq_ignore_ascii_case("planner"))
+        .or_else(|| roles.iter().find(|role| role.role_key.trim().eq_ignore_ascii_case("planner")))
+        .cloned()
+        .ok_or_else(|| "planner role is required for auto planning".to_string())?;
+    if planner.pane_id.trim().is_empty() {
+        return Err("planner role has no pane yet, please initialize roles first".to_string());
+    }
+    let planner_session_id = resolve_collab_role_session_id(&state, &planner);
+    if planner_session_id.is_empty() {
+        return Err("planner role has no session id yet, please bind sid first".to_string());
+    }
+
+    let prompt = build_collab_plan_prompt(&workbench, &run, &roles);
+    paste_to_pane_internal(&state, &planner.pane_id, &prompt, true).map_err(|error| error.to_string())?;
+    let sent_at = now_epoch();
+    let _ = mutate_collab_role_db(&state.db_path, &workbench_id, &planner.role_id, |item| {
+        item.last_sent_at = sent_at;
+        item.phase = collab_role_phase_key(CollabRolePhase::Running).to_string();
+        item.last_error = None;
+    })?;
+
+    let planner = wait_for_collab_role_completion(&state, &planner, sent_at, 120, 5)?;
+    invalidate_collab_role_preview_cache(&state, &planner);
+    let (planner_output, planner_last_seen_at) = read_collab_role_output_since(&state, &planner, sent_at)?;
+    if planner_output.trim().is_empty() {
+        return Err("planner returned no output".to_string());
+    }
+    let _ = mutate_collab_role_db(&state.db_path, &workbench_id, &planner.role_id, |item| {
+        item.last_read_at = planner_last_seen_at;
+        item.phase = collab_role_phase_key(CollabRolePhase::Ready).to_string();
+        item.last_error = None;
+    });
+
+    let plan = extract_collab_plan_block(&planner_output)
+        .ok_or_else(|| "planner output is missing a valid <collab_plan> block".to_string())?;
+    if plan.tasks.is_empty() {
+        return Err("planner returned an empty task list".to_string());
+    }
+
+    let mut seen_plan_keys = std::collections::HashSet::<String>::new();
+    let mut normalized_plan = Vec::<(
+        String,
+        String,
+        String,
+        String,
+        Vec<String>,
+        String,
+        String,
+        String,
+    )>::new();
+    for (index, item) in plan.tasks.iter().enumerate() {
+        let key = normalize_plan_task_key(&item.key, index);
+        if !seen_plan_keys.insert(key.clone()) {
+            return Err(format!("planner returned duplicate task key {}", key));
+        }
+        let role = find_collab_role_for_plan(&roles, &item.role_key)
+            .ok_or_else(|| format!("planner referenced unknown role_key {}", item.role_key.trim()))?;
+        let goal = item.goal.trim().to_string();
+        if goal.is_empty() {
+            return Err(format!("planner task {} has empty goal", key));
+        }
+        normalized_plan.push((
+            key.clone(),
+            role.role_id.clone(),
+            if item.title.trim().is_empty() {
+                format!("{} 任务", role.name)
+            } else {
+                item.title.trim().to_string()
+            },
+            goal,
+            normalize_dependency_keys(item.dependencies.as_ref(), &key),
+            item.constraints_text.clone().unwrap_or_default().trim().to_string(),
+            item.input_summary.clone().unwrap_or_default().trim().to_string(),
+            item.expected_output.clone().unwrap_or_default().trim().to_string(),
+        ));
+    }
+
+    let wave_map = compute_plan_wave_map(
+        &normalized_plan
+            .iter()
+            .map(|(key, _, _, _, dependencies, _, _, _)| (key.clone(), dependencies.clone()))
+            .collect::<Vec<_>>(),
+    )?;
+    let id_map = normalized_plan
+        .iter()
+        .map(|(key, _, _, _, _, _, _, _)| (key.clone(), Uuid::new_v4().to_string()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let created_at = now_epoch();
+    let mut created_task_ids = Vec::new();
+    for (index, (key, target_role_id, title, goal, dependencies, constraints_text, input_summary, expected_output)) in
+        normalized_plan.iter().enumerate()
+    {
+        let dependency_task_ids = dependencies
+            .iter()
+            .filter_map(|dependency_key| id_map.get(dependency_key).cloned())
+            .collect::<Vec<_>>();
+        let row = CollabTaskCardRow {
+            task_id: id_map
+                .get(key)
+                .cloned()
+                .ok_or_else(|| format!("missing generated task id for {}", key))?,
+            workbench_id: workbench_id.clone(),
+            run_id: run_id.clone(),
+            source_role_id: Some(planner.role_id.clone()),
+            target_role_id: target_role_id.clone(),
+            title: title.clone(),
+            goal: goal.clone(),
+            constraints_text: constraints_text.clone(),
+            input_summary: input_summary.clone(),
+            expected_output: expected_output.clone(),
+            status: collab_task_status_key(CollabTaskStatus::Queued).to_string(),
+            latest_reply_summary: None,
+            latest_artifact_id: None,
+            last_error: None,
+            dependency_task_ids_json: serialize_json(&dependency_task_ids)?,
+            wave_index: *wave_map.get(key).unwrap_or(&0),
+            plan_order: index as i64,
+            auto_generated: true,
+            validation_summary: None,
+            validation_checked_at: 0,
+            created_at: created_at + index as i64,
+            dispatched_at: 0,
+            replied_at: 0,
+            resolved_at: 0,
+            updated_at: created_at + index as i64,
+        };
+        save_collab_task_db(&state.db_path, &row)?;
+        insert_collab_event_db(
+            &state.db_path,
+            &workbench_id,
+            Some(&run_id),
+            Some(&row.task_id),
+            Some(&row.target_role_id),
+            "task_created",
+            &format!("自动拆解任务：{}", row.title),
+            Some(
+                serde_json::json!({
+                    "auto_generated": true,
+                    "wave_index": row.wave_index,
+                    "dependency_task_ids": dependency_task_ids,
+                    "goal": row.goal,
+                })
+                .to_string(),
+            ),
+        )?;
+        created_task_ids.push(row.task_id.clone());
+    }
+
+    let artifact_row = CollabArtifactRow {
+        artifact_id: Uuid::new_v4().to_string(),
+        workbench_id: workbench_id.clone(),
+        run_id: Some(run_id.clone()),
+        task_id: None,
+        role_id: Some(planner.role_id.clone()),
+        kind: "plan".to_string(),
+        title: format!("{} 自动计划", run.title),
+        summary: if plan.summary.trim().is_empty() {
+            format!("自动拆解生成 {} 个任务", created_task_ids.len())
+        } else {
+            plan.summary.trim().to_string()
+        },
+        content: planner_output,
+        pane_id: planner.pane_id.clone(),
+        session_id: planner_session_id,
+        created_at: now_epoch(),
+    };
+    insert_collab_artifact_db(&state.db_path, &artifact_row)?;
+    insert_collab_event_db(
+        &state.db_path,
+        &workbench_id,
+        Some(&run_id),
+        None,
+        Some(&planner.role_id),
+        "run_auto_planned",
+        &format!(
+            "自动拆解完成：{} 个任务 / {} 个波次",
+            created_task_ids.len(),
+            wave_map.values().max().copied().unwrap_or(0) + 1
+        ),
+        Some(
+            serde_json::json!({
+                "task_count": created_task_ids.len(),
+                "wave_count": wave_map.values().max().copied().unwrap_or(0) + 1,
+                "artifact_id": artifact_row.artifact_id
+            })
+            .to_string(),
+        ),
+    )?;
+    Ok(CollabAutoPlanResponse {
+        snapshot: load_collab_snapshot_db(&state, &workbench_id)?,
+        created_task_ids,
+        artifact: Some(build_collab_artifact_snapshot(&artifact_row)),
+    })
+}
+
+#[tauri::command]
+pub(crate) fn collab_dispatch_ready_wave(
+    state: State<AppState>,
+    workbench_id: String,
+    run_id: String,
+) -> Result<CollabDispatchWaveResponse, String> {
+    ensure_collab_schema(&state.db_path)?;
+    let run = load_collab_run_row_db(&state.db_path, &run_id)?;
+    if run.workbench_id != workbench_id {
+        return Err("run does not belong to workbench".to_string());
+    }
+    let tasks = list_collab_task_rows_for_run_db(&state.db_path, &run_id)?;
+    if tasks.is_empty() {
+        return Err("run has no task cards".to_string());
+    }
+    if tasks
+        .iter()
+        .any(|task| normalize_collab_task_status(&task.status) == CollabTaskStatus::Dispatched)
+    {
+        return Err("there are still dispatched tasks waiting for collection".to_string());
+    }
+    let task_map = tasks
+        .iter()
+        .map(|task| (task.task_id.clone(), task.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let ready_tasks = tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                normalize_collab_task_status(&task.status),
+                CollabTaskStatus::Draft | CollabTaskStatus::Queued
+            ) && collab_task_dependencies_accepted(task, &task_map)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if ready_tasks.is_empty() {
+        return Err("no ready task wave can be dispatched".to_string());
+    }
+    let wave_index = ready_tasks.iter().map(|task| task.wave_index).min().unwrap_or(0);
+    let mut dispatched_task_ids = Vec::new();
+    for task in ready_tasks.into_iter().filter(|task| task.wave_index == wave_index) {
+        let _ = dispatch_collab_task_internal(&state, &workbench_id, &task.task_id)?;
+        dispatched_task_ids.push(task.task_id);
+    }
+    insert_collab_event_db(
+        &state.db_path,
+        &workbench_id,
+        Some(&run_id),
+        None,
+        None,
+        "wave_dispatched",
+        &format!("已派发第 {} 波任务，共 {} 个", wave_index + 1, dispatched_task_ids.len()),
+        Some(
+            serde_json::json!({ "wave_index": wave_index, "task_ids": dispatched_task_ids.clone() }).to_string(),
+        ),
+    )?;
+    Ok(CollabDispatchWaveResponse {
+        snapshot: load_collab_snapshot_db(&state, &workbench_id)?,
+        dispatched_task_ids,
+        wave_index,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn collab_auto_validate_wave(
+    state: State<AppState>,
+    workbench_id: String,
+    run_id: String,
+    idle_threshold_secs: Option<i64>,
+) -> Result<CollabAutoValidateWaveResponse, String> {
+    ensure_collab_schema(&state.db_path)?;
+    let run = load_collab_run_row_db(&state.db_path, &run_id)?;
+    if run.workbench_id != workbench_id {
+        return Err("run does not belong to workbench".to_string());
+    }
+    let mut tasks = list_collab_task_rows_for_run_db(&state.db_path, &run_id)?;
+    if tasks.is_empty() {
+        return Err("run has no task cards".to_string());
+    }
+    let wave_index = tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                normalize_collab_task_status(&task.status),
+                CollabTaskStatus::Dispatched | CollabTaskStatus::Replied
+            )
+        })
+        .map(|task| task.wave_index)
+        .min()
+        .ok_or_else(|| "there is no active wave to validate".to_string())?;
+    tasks.sort_by_key(|task| (task.wave_index, task.plan_order, task.created_at));
+
+    let mut accepted_task_ids = Vec::new();
+    let mut rejected_task_ids = Vec::new();
+    let mut waiting_task_ids = Vec::new();
+
+    for task in tasks.into_iter().filter(|task| task.wave_index == wave_index) {
+        let task_status = normalize_collab_task_status(&task.status);
+        if collab_task_is_terminal(task_status) {
+            continue;
+        }
+        if task_status == CollabTaskStatus::Dispatched {
+            let (_collected_task, _artifact, waiting) =
+                collect_collab_task_reply_internal(&state, &workbench_id, &task.task_id, idle_threshold_secs.unwrap_or(5))?;
+            if waiting {
+                waiting_task_ids.push(task.task_id.clone());
+                continue;
+            }
+        }
+        let mut latest_task = load_collab_task_row_db(&state.db_path, &task.task_id)?;
+        if normalize_collab_task_status(&latest_task.status) == CollabTaskStatus::Replied {
+            let artifact = latest_task
+                .latest_artifact_id
+                .as_deref()
+                .and_then(|artifact_id| load_collab_artifact_row_db(&state.db_path, artifact_id).ok());
+            let reply_envelope = artifact
+                .as_ref()
+                .and_then(|item| extract_collab_reply_block(&item.content));
+            let accepted = reply_envelope.as_ref().map(|item| item.done).unwrap_or(false);
+            let summary = reply_envelope
+                .as_ref()
+                .map(|item| item.summary.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .or_else(|| latest_task.latest_reply_summary.clone())
+                .unwrap_or_else(|| {
+                    if accepted {
+                        "自动校验通过".to_string()
+                    } else {
+                        "自动校验未通过：缺少 done=true".to_string()
+                    }
+                });
+            let note = if accepted {
+                format!("自动校验通过：{}", summary)
+            } else {
+                format!("自动校验未通过：{}", summary)
+            };
+            let _ = resolve_collab_task_internal(&state, &workbench_id, &task.task_id, accepted, &note)?;
+            if accepted {
+                accepted_task_ids.push(task.task_id.clone());
+            } else {
+                rejected_task_ids.push(task.task_id.clone());
+            }
+            continue;
+        }
+        if latest_task.last_error.is_some() {
+            let now = now_epoch();
+            latest_task.status = collab_task_status_key(CollabTaskStatus::Rejected).to_string();
+            latest_task.validation_summary = Some(format!(
+                "自动校验失败：{}",
+                latest_task.last_error.clone().unwrap_or_else(|| "unknown error".to_string())
+            ));
+            latest_task.validation_checked_at = now;
+            latest_task.resolved_at = now;
+            latest_task.updated_at = now;
+            save_collab_task_db(&state.db_path, &latest_task)?;
+            insert_collab_event_db(
+                &state.db_path,
+                &workbench_id,
+                Some(&run_id),
+                Some(&latest_task.task_id),
+                Some(&latest_task.target_role_id),
+                "reply_rejected",
+                &format!("自动驳回任务：{}", latest_task.title),
+                Some(
+                    serde_json::json!({
+                        "reason": latest_task.last_error.clone().unwrap_or_default(),
+                        "auto_validation": true
+                    })
+                    .to_string(),
+                ),
+            )?;
+            rejected_task_ids.push(latest_task.task_id.clone());
+        } else {
+            waiting_task_ids.push(latest_task.task_id.clone());
+        }
+    }
+
+    insert_collab_event_db(
+        &state.db_path,
+        &workbench_id,
+        Some(&run_id),
+        None,
+        None,
+        "wave_auto_validated",
+        &format!(
+            "第 {} 波自动校验：通过 {} 个 / 驳回 {} 个 / 等待 {} 个",
+            wave_index + 1,
+            accepted_task_ids.len(),
+            rejected_task_ids.len(),
+            waiting_task_ids.len()
+        ),
+        Some(
+            serde_json::json!({
+                "wave_index": wave_index,
+                "accepted_task_ids": accepted_task_ids.clone(),
+                "rejected_task_ids": rejected_task_ids.clone(),
+                "waiting_task_ids": waiting_task_ids.clone(),
+            })
+            .to_string(),
+        ),
+    )?;
+    Ok(CollabAutoValidateWaveResponse {
+        snapshot: load_collab_snapshot_db(&state, &workbench_id)?,
+        accepted_task_ids,
+        rejected_task_ids,
+        waiting_task_ids,
+        wave_index,
     })
 }
 

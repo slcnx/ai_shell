@@ -90,6 +90,9 @@ const DEFAULT_INLINE_PREVIEW_PANEL_HEIGHT = 300;
 const MIN_INLINE_PREVIEW_PANEL_HEIGHT = 180;
 const MIN_INLINE_TERMINAL_SECTION_HEIGHT = 180;
 const INLINE_PREVIEW_SPLITTER_HEIGHT = 12;
+const SYNC_DIALOG_MODAL_Z_INDEX = 1200;
+const PREVIEW_OVERLAY_MODAL_Z_INDEX = 1300;
+const PREVIEW_DETAIL_MODAL_Z_INDEX = 1400;
 
 function normalizeAppPathname(pathname: string): string {
   if (!pathname) {
@@ -10225,6 +10228,7 @@ function App() {
         onCancel={() => closeSyncDialog()}
         title="同步中心"
         width={1100}
+        zIndex={SYNC_DIALOG_MODAL_Z_INDEX}
         footer={
           <Space>
             <Button onClick={() => closeSyncDialog()} disabled={syncDialog.syncing}>
@@ -10603,6 +10607,7 @@ function App() {
                 <SyncEntryPreviewList
                   user_avatar_src={userAvatarSrc}
                   assistant_avatar_src={assistantAvatarSrc}
+                  detail_modal_z_index={PREVIEW_DETAIL_MODAL_Z_INDEX}
                   scroll_command={syncDialogPreviewScrollCommand}
                   items={syncDialogPreviewItems}
                   empty_text={
@@ -10649,6 +10654,7 @@ function App() {
         width={1200}
         centered
         getContainer={() => document.body}
+        zIndex={PREVIEW_OVERLAY_MODAL_Z_INDEX}
         className="session-preview-overlay-modal"
         destroyOnClose={false}
       >
@@ -10690,6 +10696,7 @@ function App() {
                   show_checkbox={false}
                   user_avatar_src={userAvatarSrc}
                   assistant_avatar_src={assistantAvatarSrc}
+                  detail_modal_z_index={PREVIEW_DETAIL_MODAL_Z_INDEX}
                   scroll_command={sessionManagePreviewScrollCommand}
                   highlighted_item_id={sessionManageHighlightedMessageId}
                   items={sessionManagePreviewItems}
@@ -10740,6 +10747,7 @@ function App() {
                 <SyncEntryPreviewList
                   user_avatar_src={userAvatarSrc}
                   assistant_avatar_src={assistantAvatarSrc}
+                  detail_modal_z_index={PREVIEW_DETAIL_MODAL_Z_INDEX}
                   items={syncDialogPreviewItems}
                   empty_text={previewOverlayEmptyText}
                   on_toggle_included={(entryId, included) =>

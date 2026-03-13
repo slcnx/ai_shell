@@ -89,6 +89,12 @@ export type CollabTaskCardSnapshot = {
   latest_reply_summary: string | null;
   latest_artifact_id: string | null;
   last_error: string | null;
+  dependency_task_ids: string[];
+  wave_index: number;
+  plan_order: number;
+  auto_generated: boolean;
+  validation_summary: string | null;
+  validation_checked_at: number;
   created_at: number;
   dispatched_at: number;
   replied_at: number;

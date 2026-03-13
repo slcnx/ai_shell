@@ -29,6 +29,7 @@ import {
 } from "antd";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import ReactMarkdown, { type Components } from "react-markdown";
+import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import VirtualList, { type ListRef } from "rc-virtual-list";
 
@@ -125,6 +126,7 @@ type SyncEntryPreviewListProps = {
     resolved_detail?: SyncEntryPreviewFullContentResult | null
   ) => Promise<void> | void;
   highlighted_item_id?: string;
+  detail_modal_z_index?: number;
 };
 
 type RoleMeta = {
@@ -288,7 +290,10 @@ function SyncPreviewMarkdown({
       style={style}
     >
       <div ref={contentRef} className="sync-preview-markdown">
-        <ReactMarkdown components={syncPreviewMarkdownComponents} remarkPlugins={[remarkGfm]}>
+        <ReactMarkdown
+          components={syncPreviewMarkdownComponents}
+          remarkPlugins={[remarkGfm, remarkBreaks]}
+        >
           {content}
         </ReactMarkdown>
       </div>
@@ -311,7 +316,8 @@ function SyncEntryPreviewList({
   on_request_full_content,
   is_favorited,
   on_toggle_favorite,
-  highlighted_item_id
+  highlighted_item_id,
+  detail_modal_z_index
 }: SyncEntryPreviewListProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const holderRef = useRef<HTMLDivElement | null>(null);
@@ -909,6 +915,7 @@ function SyncEntryPreviewList({
         width={960}
         centered
         getContainer={() => document.body}
+        zIndex={detail_modal_z_index}
         destroyOnClose={false}
       >
         {detailItem ? (
@@ -934,7 +941,10 @@ function SyncEntryPreviewList({
             <Typography.Text type="danger">{detailModal.error}</Typography.Text>
           ) : detailResult ? (
             <div className="sync-preview-detail-markdown sync-preview-markdown">
-              <ReactMarkdown components={syncPreviewMarkdownComponents} remarkPlugins={[remarkGfm]}>
+              <ReactMarkdown
+                components={syncPreviewMarkdownComponents}
+                remarkPlugins={[remarkGfm, remarkBreaks]}
+              >
                 {detailResult.content}
               </ReactMarkdown>
             </div>

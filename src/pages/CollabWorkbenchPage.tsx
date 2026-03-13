@@ -20,12 +20,15 @@ import type { AiTeamWorkbenchHeaderActions } from "./AiTeamMcpPage";
 import {
   collabAcceptReply,
   collabAddRole,
+  collabAutoPlanRun,
+  collabAutoValidateWave,
   collabClearRoleSid,
   collabCollectRoleReply,
   collabCompleteRun,
   collabCreateRun,
   collabCreateTaskCard,
   collabCreateWorkbench,
+  collabDispatchReadyWave,
   collabDispatchTaskCard,
   collabGetSnapshot,
   collabInitializeRoles,
@@ -198,6 +201,7 @@ export default function CollabWorkbenchPage(props: CollabWorkbenchPageProps) {
   const [busyTaskId, setBusyTaskId] = useState("");
   const [busyRoleId, setBusyRoleId] = useState("");
   const [busyRun, setBusyRun] = useState(false);
+  const [busyAutoAction, setBusyAutoAction] = useState("");
   const [newRoleTemplate, setNewRoleTemplate] = useState("planner");
   const [newRoleName, setNewRoleName] = useState("");
   const [newRoleProvider, setNewRoleProvider] = useState(providerOptions[0] || "codex");
@@ -312,6 +316,29 @@ export default function CollabWorkbenchPage(props: CollabWorkbenchPageProps) {
       replied: items.filter((item) => item.status === "replied"),
       closed: items.filter((item) => item.status === "accepted" || item.status === "rejected" || item.status === "cancelled"),
     };
+  }, [snapshot]);
+  const taskMap = useMemo(
+    () => new Map((snapshot?.task_cards || []).map((task) => [task.task_id, task])),
+    [snapshot],
+  );
+  const waveTaskGroups = useMemo(() => {
+    const groups = new Map<number, CollabTaskCardSnapshot[]>();
+    for (const task of snapshot?.task_cards || []) {
+      const bucket = groups.get(task.wave_index) || [];
+      bucket.push(task);
+      groups.set(task.wave_index, bucket);
+    }
+    return [...groups.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([waveIndex, tasks]) => ({
+        waveIndex,
+        tasks: tasks.slice().sort((a, b) => {
+          if (a.plan_order !== b.plan_order) {
+            return a.plan_order - b.plan_order;
+          }
+          return a.created_at - b.created_at;
+        }),
+      }));
   }, [snapshot]);
 
   const updateTaskField = useCallback((key: keyof TaskFormState, value: string) => {
@@ -526,6 +553,73 @@ export default function CollabWorkbenchPage(props: CollabWorkbenchPageProps) {
       setBusyTaskId("");
     }
   }, [currentWorkbenchId, messageApi, snapshot?.active_run, taskForm]);
+
+  const autoPlanRun = useCallback(async () => {
+    if (!currentWorkbenchId || !snapshot?.active_run) {
+      messageApi.warning("璇峰厛鍒涘缓鍗忎綔 Run");
+      return;
+    }
+    setBusyAutoAction("plan");
+    try {
+      const response = await collabAutoPlanRun(currentWorkbenchId, snapshot.active_run.run_id);
+      setSnapshot(response.snapshot);
+      if (response.created_task_ids.length) {
+        setSelectedTaskId(response.created_task_ids[0]);
+      }
+      messageApi.success(`宸茶嚜鍔ㄦ媶瑙ｇ敓鎴?${response.created_task_ids.length} 涓换鍔″崱`);
+    } catch (error) {
+      console.error(error);
+      messageApi.error("鑷姩鎷嗚В璁″垝澶辫触");
+    } finally {
+      setBusyAutoAction("");
+    }
+  }, [currentWorkbenchId, messageApi, snapshot?.active_run]);
+
+  const dispatchNextWave = useCallback(async () => {
+    if (!currentWorkbenchId || !snapshot?.active_run) {
+      return;
+    }
+    setBusyAutoAction("dispatch-wave");
+    try {
+      const response = await collabDispatchReadyWave(currentWorkbenchId, snapshot.active_run.run_id);
+      setSnapshot(response.snapshot);
+      if (response.dispatched_task_ids.length) {
+        setSelectedTaskId(response.dispatched_task_ids[0]);
+      }
+      messageApi.success(`宸叉淳鍙戠 ${response.wave_index + 1} 娉?${response.dispatched_task_ids.length} 涓换鍔?`);
+    } catch (error) {
+      console.error(error);
+      messageApi.error("娲惧彂涓嬩竴娉㈠け璐?");
+    } finally {
+      setBusyAutoAction("");
+    }
+  }, [currentWorkbenchId, messageApi, snapshot?.active_run]);
+
+  const autoValidateWave = useCallback(async () => {
+    if (!currentWorkbenchId || !snapshot?.active_run) {
+      return;
+    }
+    setBusyAutoAction("validate-wave");
+    try {
+      const response = await collabAutoValidateWave(currentWorkbenchId, snapshot.active_run.run_id);
+      setSnapshot(response.snapshot);
+      if (response.accepted_task_ids.length) {
+        setSelectedTaskId(response.accepted_task_ids[0]);
+      } else if (response.rejected_task_ids.length) {
+        setSelectedTaskId(response.rejected_task_ids[0]);
+      } else if (response.waiting_task_ids.length) {
+        setSelectedTaskId(response.waiting_task_ids[0]);
+      }
+      messageApi.success(
+        `绗?${response.wave_index + 1} 娉㈡牎楠岀粨鏋滐細閫氳繃 ${response.accepted_task_ids.length} / 椹冲洖 ${response.rejected_task_ids.length} / 绛夊緟 ${response.waiting_task_ids.length}`,
+      );
+    } catch (error) {
+      console.error(error);
+      messageApi.error("鑷姩鏍￠獙褰撳墠娉㈠け璐?");
+    } finally {
+      setBusyAutoAction("");
+    }
+  }, [currentWorkbenchId, messageApi, snapshot?.active_run]);
 
   const dispatchTask = useCallback(
     (task: CollabTaskCardSnapshot) => {
@@ -771,6 +865,35 @@ export default function CollabWorkbenchPage(props: CollabWorkbenchPageProps) {
                     <Typography.Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>
                       {snapshot.active_run.goal}
                     </Typography.Paragraph>
+                    <Space size={[8, 8]} wrap>
+                      <Tag color="blue">任务 {snapshot.task_cards.length}</Tag>
+                      <Tag color="cyan">波次 {waveTaskGroups.length}</Tag>
+                      <Tag color="green">已完成 {groupedTasks.closed.length}</Tag>
+                    </Space>
+                    <Space size={[8, 8]} wrap>
+                      <Button
+                        type="primary"
+                        loading={busyAutoAction === "plan"}
+                        disabled={snapshot.task_cards.length > 0}
+                        onClick={() => void autoPlanRun()}
+                      >
+                        自动拆解计划
+                      </Button>
+                      <Button
+                        loading={busyAutoAction === "dispatch-wave"}
+                        disabled={!snapshot.task_cards.length}
+                        onClick={() => void dispatchNextWave()}
+                      >
+                        执行下一波
+                      </Button>
+                      <Button
+                        loading={busyAutoAction === "validate-wave"}
+                        disabled={!snapshot.task_cards.length}
+                        onClick={() => void autoValidateWave()}
+                      >
+                        自动校验当前波
+                      </Button>
+                    </Space>
                     {snapshot.active_run.final_summary ? (
                       <Alert type="success" showIcon message={snapshot.active_run.final_summary} />
                     ) : null}
@@ -866,6 +989,35 @@ export default function CollabWorkbenchPage(props: CollabWorkbenchPageProps) {
                 </Form>
               </Card>
 
+              <Card size="small" title="依赖图">
+                {waveTaskGroups.length ? (
+                  <Space direction="vertical" size={10} style={{ width: "100%" }}>
+                    {waveTaskGroups.map((group) => (
+                      <Card key={`wave-${group.waveIndex}`} size="small" title={`第 ${group.waveIndex + 1} 波`}>
+                        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                          {group.tasks.map((task) => (
+                            <div key={task.task_id}>
+                              <Space size={[8, 8]} wrap>
+                                <Typography.Text strong>{task.title}</Typography.Text>
+                                <Tag color={taskStatusColor(task.status)}>{task.status}</Tag>
+                                <Tag>{roleMap.get(task.target_role_id)?.name || task.target_role_id}</Tag>
+                              </Space>
+                              <Typography.Text type="secondary">
+                                {task.dependency_task_ids.length
+                                  ? `依赖 ${task.dependency_task_ids.map((dependencyId) => taskMap.get(dependencyId)?.title || dependencyId).join(" / ")}`
+                                  : "起始任务"}
+                              </Typography.Text>
+                            </div>
+                          ))}
+                        </Space>
+                      </Card>
+                    ))}
+                  </Space>
+                ) : (
+                  <Typography.Text type="secondary">当前还没有可展示的依赖图</Typography.Text>
+                )}
+              </Card>
+
               <div className="collab-task-board">
                 {[
                   { key: "queued", title: "待派发", items: groupedTasks.queued },
@@ -888,6 +1040,9 @@ export default function CollabWorkbenchPage(props: CollabWorkbenchPageProps) {
                               <Space wrap>
                                 <Typography.Text strong>{task.title}</Typography.Text>
                                 <Tag color={taskStatusColor(task.status)}>{task.status}</Tag>
+                                <Tag color="blue">波 {task.wave_index + 1}</Tag>
+                                {task.auto_generated ? <Tag color="cyan">自动计划</Tag> : null}
+                                {task.dependency_task_ids.length ? <Tag color="gold">依赖 {task.dependency_task_ids.length}</Tag> : null}
                               </Space>
                               <Typography.Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>
                                 {task.goal}
@@ -895,7 +1050,20 @@ export default function CollabWorkbenchPage(props: CollabWorkbenchPageProps) {
                               <Typography.Text type="secondary">
                                 目标角色：{roleMap.get(task.target_role_id)?.name || task.target_role_id}
                               </Typography.Text>
+                              {task.dependency_task_ids.length ? (
+                                <Typography.Text type="secondary">
+                                  依赖：
+                                  {task.dependency_task_ids.map((dependencyId) => taskMap.get(dependencyId)?.title || dependencyId).join(" / ")}
+                                </Typography.Text>
+                              ) : null}
                               {task.latest_reply_summary ? <Alert type="info" showIcon message={task.latest_reply_summary} /> : null}
+                              {task.validation_summary ? (
+                                <Alert
+                                  type={task.status === "accepted" ? "success" : task.status === "rejected" ? "error" : "info"}
+                                  showIcon
+                                  message={task.validation_summary}
+                                />
+                              ) : null}
                               {task.last_error ? <Alert type="error" showIcon message={task.last_error} /> : null}
                               <Space wrap>
                                 {(task.status === "queued" || task.status === "draft") ? (
@@ -989,6 +1157,21 @@ export default function CollabWorkbenchPage(props: CollabWorkbenchPageProps) {
                     <Typography.Text type="secondary">创建时间：{formatTs(selectedTask.created_at)}</Typography.Text>
                     <Typography.Text type="secondary">派发时间：{formatTs(selectedTask.dispatched_at)}</Typography.Text>
                     <Typography.Text type="secondary">回执时间：{formatTs(selectedTask.replied_at)}</Typography.Text>
+                    <Typography.Text type="secondary">波次：第 {selectedTask.wave_index + 1} 波</Typography.Text>
+                    {selectedTask.dependency_task_ids.length ? (
+                      <Typography.Text type="secondary">
+                        依赖：{selectedTask.dependency_task_ids.map((dependencyId) => taskMap.get(dependencyId)?.title || dependencyId).join(" / ")}
+                      </Typography.Text>
+                    ) : (
+                      <Typography.Text type="secondary">依赖：无</Typography.Text>
+                    )}
+                    {selectedTask.validation_summary ? (
+                      <Alert
+                        type={selectedTask.status === "accepted" ? "success" : selectedTask.status === "rejected" ? "error" : "info"}
+                        showIcon
+                        message={selectedTask.validation_summary}
+                      />
+                    ) : null}
                     {selectedTask.constraints_text ? (
                       <Alert type="warning" showIcon message={selectedTask.constraints_text} />
                     ) : null}

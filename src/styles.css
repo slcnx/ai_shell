@@ -1510,6 +1510,12 @@ body,
   margin: 0 0 10px;
 }
 
+.sync-preview-markdown p,
+.sync-preview-markdown li,
+.sync-preview-markdown blockquote {
+  white-space: pre-wrap;
+}
+
 .sync-preview-markdown ul,
 .sync-preview-markdown ol {
   padding-inline-start: 20px;
