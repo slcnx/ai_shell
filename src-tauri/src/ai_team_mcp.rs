@@ -407,7 +407,11 @@ fn upsert_ai_team_role_definition_db(
     Ok(())
 }
 
-fn load_ai_team_role_row_db(path: &Path, team_id: &str, role_key: &str) -> Result<AiTeamRoleRow, String> {
+fn load_ai_team_role_row_db(
+    path: &Path,
+    team_id: &str,
+    role_key: &str,
+) -> Result<AiTeamRoleRow, String> {
     let connection = open_db(path).map_err(|error| error.to_string())?;
     connection
         .query_row(
@@ -485,9 +489,9 @@ fn role_session_id_used_by_other_role(
         return Ok(false);
     }
     let roles = list_ai_team_role_rows_db(path, team_id)?;
-    Ok(roles.into_iter().any(|item| {
-        item.role_key != role_key && item.session_id.trim() == normalized
-    }))
+    Ok(roles
+        .into_iter()
+        .any(|item| item.role_key != role_key && item.session_id.trim() == normalized))
 }
 
 fn save_ai_team_role_row_db(path: &Path, row: &AiTeamRoleRow) -> Result<(), String> {
@@ -569,7 +573,10 @@ fn load_ai_team_run_db(path: &Path, run_id: &str) -> Result<AiTeamRunSnapshot, S
         .map_err(|error| error.to_string())
 }
 
-fn load_latest_ai_team_run_db(path: &Path, team_id: &str) -> Result<Option<AiTeamRunSnapshot>, String> {
+fn load_latest_ai_team_run_db(
+    path: &Path,
+    team_id: &str,
+) -> Result<Option<AiTeamRunSnapshot>, String> {
     let connection = open_db(path).map_err(|error| error.to_string())?;
     connection
         .query_row(
@@ -688,12 +695,22 @@ fn load_cached_native_preview_rows(
                 .map_err(|error| error.to_string())?
             }
         } else {
-            collect_native_session_preview_rows_for_provider(state, native_provider, session_id, matcher)
-                .map_err(|error| error.to_string())?
+            collect_native_session_preview_rows_for_provider(
+                state,
+                native_provider,
+                session_id,
+                matcher,
+            )
+            .map_err(|error| error.to_string())?
         }
     } else {
-        collect_native_session_preview_rows_for_provider(state, native_provider, session_id, matcher)
-            .map_err(|error| error.to_string())?
+        collect_native_session_preview_rows_for_provider(
+            state,
+            native_provider,
+            session_id,
+            matcher,
+        )
+        .map_err(|error| error.to_string())?
     };
 
     if let Ok(mut cache) = state.native_session_preview_cache.lock() {
@@ -708,7 +725,10 @@ fn load_cached_native_preview_rows(
     Ok(all_rows)
 }
 
-fn load_role_preview_rows(state: &AppState, row: &AiTeamRoleRow) -> Result<Vec<NativeSessionPreviewRow>, String> {
+fn load_role_preview_rows(
+    state: &AppState,
+    row: &AiTeamRoleRow,
+) -> Result<Vec<NativeSessionPreviewRow>, String> {
     let pane_id = row.pane_id.trim();
     let session_id = resolve_role_session_id(state, row);
     if pane_id.is_empty() || session_id.is_empty() {
@@ -801,13 +821,19 @@ fn compute_role_status_from_row(
     }
 
     let latest = last_input_any.max(last_output_any);
-    let idle_secs = if latest > 0 { now.saturating_sub(latest) } else { 0 };
+    let idle_secs = if latest > 0 {
+        now.saturating_sub(latest)
+    } else {
+        0
+    };
     Ok(AiTeamConversationStatusResponse {
         role: row.role_key.clone(),
         session_id,
         runtime_ready,
         responding: last_input_any > last_output_any && idle_secs < threshold,
-        completed: last_output_any >= last_input_any && last_output_any > 0 && idle_secs >= threshold,
+        completed: last_output_any >= last_input_any
+            && last_output_any > 0
+            && idle_secs >= threshold,
         idle_secs,
         last_input_at: last_input_any,
         last_output_at: last_output_any,
@@ -837,11 +863,17 @@ fn build_role_snapshot(state: &AppState, row: &AiTeamRoleRow) -> AiTeamRoleSnaps
     }
 }
 
-fn load_ai_team_snapshot_db(state: &AppState, team_id: &str) -> Result<AiTeamSnapshotResponse, String> {
+fn load_ai_team_snapshot_db(
+    state: &AppState,
+    team_id: &str,
+) -> Result<AiTeamSnapshotResponse, String> {
     ensure_ai_team_schema(&state.db_path)?;
     let team = load_ai_team_team_row_db(&state.db_path, team_id)?;
     let roles = list_ai_team_role_rows_db(&state.db_path, team_id)?;
-    let role_snapshots = roles.iter().map(|item| build_role_snapshot(state, item)).collect::<Vec<_>>();
+    let role_snapshots = roles
+        .iter()
+        .map(|item| build_role_snapshot(state, item))
+        .collect::<Vec<_>>();
     let active_run = load_latest_ai_team_run_db(&state.db_path, team_id)?;
     let _timestamps = (team.created_at, team.updated_at);
     Ok(AiTeamSnapshotResponse {
@@ -895,7 +927,8 @@ fn ensure_ai_team_role_pane(
         &role.provider,
     )
     .map_err(|error| error.to_string())?;
-    start_runtime(app, state, pane.id.clone(), pane.provider.clone()).map_err(|error| error.to_string())?;
+    start_runtime(app, state, pane.id.clone(), pane.provider.clone())
+        .map_err(|error| error.to_string())?;
     mutate_ai_team_role_db(&state.db_path, team_id, role_key, |item| {
         item.pane_id = pane.id.clone();
         item.session_id.clear();
@@ -905,13 +938,18 @@ fn ensure_ai_team_role_pane(
     Ok((pane.id, true))
 }
 
-fn launch_role_provider_shell(state: &AppState, team_id: &str, role_key: &str) -> Result<(), String> {
+fn launch_role_provider_shell(
+    state: &AppState,
+    team_id: &str,
+    role_key: &str,
+) -> Result<(), String> {
     let role = load_ai_team_role_row_db(&state.db_path, team_id, role_key)?;
     if role.pane_id.trim().is_empty() {
         return Err(format!("role {} has no pane yet", role_key));
     }
     let bridge = resolve_chat_bridge(&state.adapter_config_dir, &role.provider)?;
-    paste_to_pane_internal(state, &role.pane_id, bridge.command(), true).map_err(|error| error.to_string())?;
+    paste_to_pane_internal(state, &role.pane_id, bridge.command(), true)
+        .map_err(|error| error.to_string())?;
     let _ = upsert_pane_session_state_db(
         &state.db_path,
         &role.pane_id,
@@ -946,10 +984,18 @@ fn bind_role_sid_inner(
     let normalized_role = normalize_ai_team_role_key(role_key)?;
     let role = load_ai_team_role_row_db(&state.db_path, team_id, &normalized_role)?;
     if role.pane_id.trim().is_empty() {
-        return Err(format!("role {} has no pane yet, please initialize first", normalized_role));
+        return Err(format!(
+            "role {} has no pane yet, please initialize first",
+            normalized_role
+        ));
     }
     if !role.session_id.trim().is_empty()
-        && !role_session_id_used_by_other_role(&state.db_path, team_id, &normalized_role, &role.session_id)?
+        && !role_session_id_used_by_other_role(
+            &state.db_path,
+            team_id,
+            &normalized_role,
+            &role.session_id,
+        )?
     {
         let updated = mutate_ai_team_role_db(&state.db_path, team_id, &normalized_role, |item| {
             item.phase = ai_team_role_phase_key(AiTeamRolePhase::Ready).to_string();
@@ -965,7 +1011,8 @@ fn bind_role_sid_inner(
         .map_err(|error| error.to_string())?;
         return Ok((build_role_snapshot(state, &updated), true));
     }
-    paste_to_pane_internal(state, &role.pane_id, hello_message.trim(), true).map_err(|error| error.to_string())?;
+    paste_to_pane_internal(state, &role.pane_id, hello_message.trim(), true)
+        .map_err(|error| error.to_string())?;
     let sent_at = now_epoch();
     mutate_ai_team_role_db(&state.db_path, team_id, &normalized_role, |item| {
         item.last_sent_at = sent_at;
@@ -976,11 +1023,13 @@ fn bind_role_sid_inner(
     let suggested = suggest_role_session_id(state, &role.pane_id, timeout_secs)?;
     let next_sid = suggested.unwrap_or_default().trim().to_string();
     if !next_sid.is_empty() {
-        if role_session_id_used_by_other_role(&state.db_path, team_id, &normalized_role, &next_sid)? {
-            let updated = mutate_ai_team_role_db(&state.db_path, team_id, &normalized_role, |item| {
-                item.phase = ai_team_role_phase_key(AiTeamRolePhase::Error).to_string();
-                item.last_error = Some("session id already used by other role".to_string());
-            })?;
+        if role_session_id_used_by_other_role(&state.db_path, team_id, &normalized_role, &next_sid)?
+        {
+            let updated =
+                mutate_ai_team_role_db(&state.db_path, team_id, &normalized_role, |item| {
+                    item.phase = ai_team_role_phase_key(AiTeamRolePhase::Error).to_string();
+                    item.last_error = Some("session id already used by other role".to_string());
+                })?;
             return Ok((build_role_snapshot(state, &updated), false));
         }
         upsert_pane_session_state_db(
@@ -1014,17 +1063,18 @@ fn refresh_role_sid_inner(
     let normalized_role = normalize_ai_team_role_key(role_key)?;
     let role = load_ai_team_role_row_db(&state.db_path, team_id, &normalized_role)?;
     if role.pane_id.trim().is_empty() {
-        return Err(format!("role {} has no pane yet, please initialize first", normalized_role));
+        return Err(format!(
+            "role {} has no pane yet, please initialize first",
+            normalized_role
+        ));
     }
 
-    let suggested = suggest_role_session_id(
-        state,
-        &role.pane_id,
-        STATUS_SESSION_DETECT_TIMEOUT_SECS,
-    )?;
+    let suggested =
+        suggest_role_session_id(state, &role.pane_id, STATUS_SESSION_DETECT_TIMEOUT_SECS)?;
     let next_sid = suggested.unwrap_or_default().trim().to_string();
     if !next_sid.is_empty() {
-        if role_session_id_used_by_other_role(&state.db_path, team_id, &normalized_role, &next_sid)? {
+        if role_session_id_used_by_other_role(&state.db_path, team_id, &normalized_role, &next_sid)?
+        {
             return Ok(role_sid_response(state, &role));
         }
         upsert_pane_session_state_db(
@@ -1068,9 +1118,13 @@ fn send_role_hello_inner(
     let normalized_role = normalize_ai_team_role_key(role_key)?;
     let role = load_ai_team_role_row_db(&state.db_path, team_id, &normalized_role)?;
     if role.pane_id.trim().is_empty() {
-        return Err(format!("role {} has no pane yet, please initialize first", normalized_role));
+        return Err(format!(
+            "role {} has no pane yet, please initialize first",
+            normalized_role
+        ));
     }
-    paste_to_pane_internal(state, &role.pane_id, hello_message.trim(), true).map_err(|error| error.to_string())?;
+    paste_to_pane_internal(state, &role.pane_id, hello_message.trim(), true)
+        .map_err(|error| error.to_string())?;
     let sent_at = now_epoch();
     let _ = mutate_ai_team_role_db(&state.db_path, team_id, &normalized_role, |item| {
         item.last_sent_at = sent_at;
@@ -1095,13 +1149,20 @@ fn send_role_message_inner(
     let normalized_role = normalize_ai_team_role_key(role_key)?;
     let role = load_ai_team_role_row_db(&state.db_path, team_id, &normalized_role)?;
     if role.pane_id.trim().is_empty() {
-        return Err(format!("role {} has no pane yet, please initialize first", normalized_role));
+        return Err(format!(
+            "role {} has no pane yet, please initialize first",
+            normalized_role
+        ));
     }
     let session_id = resolve_role_session_id(state, &role);
     if session_id.is_empty() {
-        return Err(format!("role {} has no session id yet, please bind sid first", normalized_role));
+        return Err(format!(
+            "role {} has no session id yet, please bind sid first",
+            normalized_role
+        ));
     }
-    paste_to_pane_internal(state, &role.pane_id, message, submit).map_err(|error| error.to_string())?;
+    paste_to_pane_internal(state, &role.pane_id, message, submit)
+        .map_err(|error| error.to_string())?;
     let sent_at = now_epoch();
     mutate_ai_team_role_db(&state.db_path, team_id, &normalized_role, |item| {
         item.last_sent_at = sent_at;
@@ -1183,7 +1244,11 @@ fn load_role_conversation_inner(
     })
 }
 
-fn read_role_output_since(state: &AppState, row: &AiTeamRoleRow, since_at: i64) -> Result<(String, i64), String> {
+fn read_role_output_since(
+    state: &AppState,
+    row: &AiTeamRoleRow,
+    since_at: i64,
+) -> Result<(String, i64), String> {
     let rows = load_role_preview_rows(state, row)?;
     let mut pieces = Vec::new();
     let mut last_seen = 0_i64;
@@ -1198,7 +1263,11 @@ fn read_role_output_since(state: &AppState, row: &AiTeamRoleRow, since_at: i64) 
     Ok((pieces.join("\n\n"), last_seen))
 }
 
-fn extract_json_block<T: DeserializeOwned>(content: &str, start_tag: &str, end_tag: &str) -> Option<T> {
+fn extract_json_block<T: DeserializeOwned>(
+    content: &str,
+    start_tag: &str,
+    end_tag: &str,
+) -> Option<T> {
     let start = content.rfind(start_tag)?;
     let suffix = &content[start + start_tag.len()..];
     let end = suffix.find(end_tag)?;
@@ -1214,7 +1283,10 @@ fn extract_final_block(content: &str) -> Option<AiTeamFinalEnvelope> {
     extract_json_block(content, "<ai_team_final>", "</ai_team_final>")
 }
 
-fn build_analyst_requirement_prompt(snapshot: &AiTeamSnapshotResponse, requirement: &str) -> String {
+fn build_analyst_requirement_prompt(
+    snapshot: &AiTeamSnapshotResponse,
+    requirement: &str,
+) -> String {
     let coder_sid = snapshot
         .roles
         .iter()
@@ -1362,7 +1434,10 @@ pub(crate) fn ai_team_set_role_sid(
     }
     let role = load_ai_team_role_row_db(&state.db_path, &team_id, &normalized_role)?;
     if role.pane_id.trim().is_empty() {
-        return Err(format!("role {} has no pane yet, please initialize first", normalized_role));
+        return Err(format!(
+            "role {} has no pane yet, please initialize first",
+            normalized_role
+        ));
     }
     if role_session_id_used_by_other_role(&state.db_path, &team_id, &normalized_role, &sid)? {
         return Err(format!("session id already used by other role: {}", sid));
@@ -1392,7 +1467,10 @@ pub(crate) fn ai_team_clear_role_sid(
     let normalized_role = normalize_ai_team_role_key(&role_key)?;
     let role = load_ai_team_role_row_db(&state.db_path, &team_id, &normalized_role)?;
     if role.pane_id.trim().is_empty() {
-        return Err(format!("role {} has no pane yet, please initialize first", normalized_role));
+        return Err(format!(
+            "role {} has no pane yet, please initialize first",
+            normalized_role
+        ));
     }
     upsert_pane_session_state_db(
         &state.db_path,
@@ -1426,7 +1504,12 @@ pub(crate) fn ai_team_send_role_hello(
     role_key: String,
     hello_message: Option<String>,
 ) -> Result<AiTeamSendHelloResponse, String> {
-    send_role_hello_inner(&state, &team_id, &role_key, hello_message.as_deref().unwrap_or("你好"))
+    send_role_hello_inner(
+        &state,
+        &team_id,
+        &role_key,
+        hello_message.as_deref().unwrap_or("你好"),
+    )
 }
 
 #[tauri::command]
@@ -1504,7 +1587,13 @@ pub(crate) fn ai_team_send_message(
     message: String,
     submit: Option<bool>,
 ) -> Result<AiTeamSendMessageResponse, String> {
-    send_role_message_inner(&state, &team_id, &role_key, message.trim(), submit.unwrap_or(true))
+    send_role_message_inner(
+        &state,
+        &team_id,
+        &role_key,
+        message.trim(),
+        submit.unwrap_or(true),
+    )
 }
 
 #[tauri::command]
@@ -1555,7 +1644,10 @@ pub(crate) fn ai_team_submit_requirement(
         }
     }
     let snapshot = load_ai_team_snapshot_db(&state, &team_id)?;
-    let analyst = snapshot.roles.iter().find(|item| item.role_key == "analyst");
+    let analyst = snapshot
+        .roles
+        .iter()
+        .find(|item| item.role_key == "analyst");
     if analyst.map(|item| item.sid_bound).unwrap_or(false) == false {
         return Err("analyst role has no sid yet, please bind sid first".to_string());
     }
@@ -1623,13 +1715,16 @@ pub(crate) fn ai_team_execute_next(
                 });
             }
 
-            let (analyst_output, last_seen_at) = read_role_output_since(&state, &analyst_row, analyst_row.last_sent_at)?;
+            let (analyst_output, last_seen_at) =
+                read_role_output_since(&state, &analyst_row, analyst_row.last_sent_at)?;
             let _ = mutate_ai_team_role_db(&state.db_path, &team_id, "analyst", |item| {
                 item.last_read_at = last_seen_at;
                 item.phase = ai_team_role_phase_key(AiTeamRolePhase::Ready).to_string();
             });
 
-            if let Some(AiTeamActionEnvelope::Delegate { target, message }) = extract_action_block(&analyst_output) {
+            if let Some(AiTeamActionEnvelope::Delegate { target, message }) =
+                extract_action_block(&analyst_output)
+            {
                 if target.trim().eq_ignore_ascii_case("coder") {
                     let snapshot = load_ai_team_snapshot_db(&state, &team_id)?;
                     let coder_prompt = build_coder_prompt(&message, &snapshot.project_directory);
@@ -1681,7 +1776,8 @@ pub(crate) fn ai_team_execute_next(
                 });
             }
 
-            let (coder_output, last_seen_at) = read_role_output_since(&state, &coder_row, coder_row.last_sent_at)?;
+            let (coder_output, last_seen_at) =
+                read_role_output_since(&state, &coder_row, coder_row.last_sent_at)?;
             let _ = mutate_ai_team_role_db(&state.db_path, &team_id, "coder", |item| {
                 item.last_read_at = last_seen_at;
                 item.phase = ai_team_role_phase_key(AiTeamRolePhase::Ready).to_string();

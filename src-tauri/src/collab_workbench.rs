@@ -685,7 +685,11 @@ fn normalize_role_key_candidate(raw: &str) -> String {
         .join("_")
 }
 
-fn next_unique_role_key(existing: &[CollabRoleRow], requested: Option<&str>, template_key: &str) -> String {
+fn next_unique_role_key(
+    existing: &[CollabRoleRow],
+    requested: Option<&str>,
+    template_key: &str,
+) -> String {
     let base = normalize_role_key_candidate(requested.unwrap_or(template_key));
     let base = if base.is_empty() {
         template_key.to_string()
@@ -740,8 +744,10 @@ fn built_in_role_template(template_key: &str) -> Result<CollabRoleTemplateRespon
                 },
             ],
             prompt_pack: CollabPromptPack {
-                system_prompt: "你负责梳理目标、约束、依赖和拆解思路，输出清晰任务建议。".to_string(),
-                reply_contract: "输出结论、风险、建议下一步，并在末尾提供结构化回复块。".to_string(),
+                system_prompt: "你负责梳理目标、约束、依赖和拆解思路，输出清晰任务建议。"
+                    .to_string(),
+                reply_contract: "输出结论、风险、建议下一步，并在末尾提供结构化回复块。"
+                    .to_string(),
                 can_suggest_followups: true,
             },
         },
@@ -775,7 +781,8 @@ fn built_in_role_template(template_key: &str) -> Result<CollabRoleTemplateRespon
             ],
             prompt_pack: CollabPromptPack {
                 system_prompt: "你负责执行具体任务，清楚说明改动、验证和剩余风险。".to_string(),
-                reply_contract: "输出结果摘要、交付物、验证方式，并在末尾提供结构化回复块。".to_string(),
+                reply_contract: "输出结果摘要、交付物、验证方式，并在末尾提供结构化回复块。"
+                    .to_string(),
                 can_suggest_followups: true,
             },
         },
@@ -809,7 +816,8 @@ fn built_in_role_template(template_key: &str) -> Result<CollabRoleTemplateRespon
             ],
             prompt_pack: CollabPromptPack {
                 system_prompt: "你负责评审阶段结果，指出缺口、风险和是否建议采纳。".to_string(),
-                reply_contract: "输出评审意见、阻塞问题、建议下一步，并在末尾提供结构化回复块。".to_string(),
+                reply_contract: "输出评审意见、阻塞问题、建议下一步，并在末尾提供结构化回复块。"
+                    .to_string(),
                 can_suggest_followups: true,
             },
         },
@@ -910,12 +918,22 @@ fn load_cached_native_preview_rows(
                 .map_err(|error| error.to_string())?
             }
         } else {
-            collect_native_session_preview_rows_for_provider(state, native_provider, session_id, matcher)
-                .map_err(|error| error.to_string())?
+            collect_native_session_preview_rows_for_provider(
+                state,
+                native_provider,
+                session_id,
+                matcher,
+            )
+            .map_err(|error| error.to_string())?
         }
     } else {
-        collect_native_session_preview_rows_for_provider(state, native_provider, session_id, matcher)
-            .map_err(|error| error.to_string())?
+        collect_native_session_preview_rows_for_provider(
+            state,
+            native_provider,
+            session_id,
+            matcher,
+        )
+        .map_err(|error| error.to_string())?
     };
     if let Ok(mut cache) = state.native_session_preview_cache.lock() {
         cache.insert(
@@ -1005,10 +1023,16 @@ fn compute_collab_role_status_from_row(
         });
     }
     let latest = last_input_any.max(last_output_any);
-    let idle_secs = if latest > 0 { now.saturating_sub(latest) } else { 0 };
+    let idle_secs = if latest > 0 {
+        now.saturating_sub(latest)
+    } else {
+        0
+    };
     Ok(CollabRoleStatus {
         responding: last_input_any > last_output_any && idle_secs < threshold,
-        completed: last_output_any >= last_input_any && last_output_any > 0 && idle_secs >= threshold,
+        completed: last_output_any >= last_input_any
+            && last_output_any > 0
+            && idle_secs >= threshold,
         idle_secs,
         last_input_at: last_input_any,
         last_output_at: last_output_any,
@@ -1216,7 +1240,10 @@ fn upsert_collab_workbench_db(
     Ok(())
 }
 
-fn load_collab_workbench_row_db(path: &Path, workbench_id: &str) -> Result<CollabWorkbenchRow, String> {
+fn load_collab_workbench_row_db(
+    path: &Path,
+    workbench_id: &str,
+) -> Result<CollabWorkbenchRow, String> {
     let connection = open_db(path).map_err(|error| error.to_string())?;
     connection
         .query_row(
@@ -1319,7 +1346,11 @@ fn save_collab_role_db(path: &Path, row: &CollabRoleRow) -> Result<(), String> {
     Ok(())
 }
 
-fn load_collab_role_row_db(path: &Path, workbench_id: &str, role_id: &str) -> Result<CollabRoleRow, String> {
+fn load_collab_role_row_db(
+    path: &Path,
+    workbench_id: &str,
+    role_id: &str,
+) -> Result<CollabRoleRow, String> {
     let connection = open_db(path).map_err(|error| error.to_string())?;
     connection
         .query_row(
@@ -1482,7 +1513,10 @@ fn load_collab_run_row_db(path: &Path, run_id: &str) -> Result<CollabRunRow, Str
         .map_err(|error| error.to_string())
 }
 
-fn load_active_collab_run_row_db(path: &Path, workbench_id: &str) -> Result<Option<CollabRunRow>, String> {
+fn load_active_collab_run_row_db(
+    path: &Path,
+    workbench_id: &str,
+) -> Result<Option<CollabRunRow>, String> {
     let connection = open_db(path).map_err(|error| error.to_string())?;
     connection
         .query_row(
@@ -1511,7 +1545,10 @@ fn load_active_collab_run_row_db(path: &Path, workbench_id: &str) -> Result<Opti
         .map_err(|error| error.to_string())
 }
 
-fn load_latest_collab_run_row_db(path: &Path, workbench_id: &str) -> Result<Option<CollabRunRow>, String> {
+fn load_latest_collab_run_row_db(
+    path: &Path,
+    workbench_id: &str,
+) -> Result<Option<CollabRunRow>, String> {
     let connection = open_db(path).map_err(|error| error.to_string())?;
     connection
         .query_row(
@@ -1648,7 +1685,10 @@ fn load_collab_task_row_db(path: &Path, task_id: &str) -> Result<CollabTaskCardR
         .map_err(|error| error.to_string())
 }
 
-fn list_collab_task_rows_for_run_db(path: &Path, run_id: &str) -> Result<Vec<CollabTaskCardRow>, String> {
+fn list_collab_task_rows_for_run_db(
+    path: &Path,
+    run_id: &str,
+) -> Result<Vec<CollabTaskCardRow>, String> {
     let connection = open_db(path).map_err(|error| error.to_string())?;
     let mut stmt = connection
         .prepare(
@@ -1709,7 +1749,11 @@ fn count_tasks_for_role_db(path: &Path, role_id: &str) -> Result<i64, String> {
         .map_err(|error| error.to_string())
 }
 
-fn list_collab_event_rows_db(path: &Path, workbench_id: &str, run_id: Option<&str>) -> Result<Vec<CollabEventRow>, String> {
+fn list_collab_event_rows_db(
+    path: &Path,
+    workbench_id: &str,
+    run_id: Option<&str>,
+) -> Result<Vec<CollabEventRow>, String> {
     let connection = open_db(path).map_err(|error| error.to_string())?;
     let sql = if run_id.is_some() {
         r#"
@@ -1781,7 +1825,10 @@ fn list_collab_artifact_rows_db(
     Ok(items)
 }
 
-fn load_collab_artifact_row_db(path: &Path, artifact_id: &str) -> Result<CollabArtifactRow, String> {
+fn load_collab_artifact_row_db(
+    path: &Path,
+    artifact_id: &str,
+) -> Result<CollabArtifactRow, String> {
     let connection = open_db(path).map_err(|error| error.to_string())?;
     connection
         .query_row(
@@ -1807,8 +1854,11 @@ fn load_collab_snapshot_db(
         .iter()
         .map(|item| build_collab_role_snapshot(state, item))
         .collect::<Vec<_>>();
-    let active_run = load_active_collab_run_row_db(&state.db_path, workbench_id)?
-        .or_else(|| load_latest_collab_run_row_db(&state.db_path, workbench_id).ok().flatten());
+    let active_run = load_active_collab_run_row_db(&state.db_path, workbench_id)?.or_else(|| {
+        load_latest_collab_run_row_db(&state.db_path, workbench_id)
+            .ok()
+            .flatten()
+    });
     let active_run_snapshot = active_run.as_ref().map(build_collab_run_snapshot);
     let task_cards = if let Some(run) = active_run.as_ref() {
         list_collab_task_rows_for_run_db(&state.db_path, &run.run_id)?
@@ -1847,7 +1897,11 @@ fn create_role_row_from_input(
     input: &CollabRoleInput,
 ) -> Result<CollabRoleRow, String> {
     let template = built_in_role_template(&input.template_key)?;
-    let role_key = next_unique_role_key(existing_roles, input.role_key.as_deref(), &template.template_key);
+    let role_key = next_unique_role_key(
+        existing_roles,
+        input.role_key.as_deref(),
+        &template.template_key,
+    );
     let provider = input.provider.trim().to_lowercase();
     if provider.is_empty() {
         return Err("role provider is empty".to_string());
@@ -1921,7 +1975,8 @@ fn ensure_collab_role_pane(
         &role.provider,
     )
     .map_err(|error| error.to_string())?;
-    start_runtime(app, state, pane.id.clone(), pane.provider.clone()).map_err(|error| error.to_string())?;
+    start_runtime(app, state, pane.id.clone(), pane.provider.clone())
+        .map_err(|error| error.to_string())?;
     mutate_collab_role_db(&state.db_path, workbench_id, role_id, |item| {
         item.pane_id = pane.id.clone();
         item.session_id.clear();
@@ -1941,7 +1996,8 @@ fn launch_collab_role_provider_shell(
         return Err(format!("role {} has no pane yet", role.role_key));
     }
     let bridge = resolve_chat_bridge(&state.adapter_config_dir, &role.provider)?;
-    paste_to_pane_internal(state, &role.pane_id, bridge.command(), true).map_err(|error| error.to_string())?;
+    paste_to_pane_internal(state, &role.pane_id, bridge.command(), true)
+        .map_err(|error| error.to_string())?;
     let _ = upsert_pane_session_state_db(
         &state.db_path,
         &role.pane_id,
@@ -1966,7 +2022,8 @@ fn build_collab_dispatch_prompt(
 ) -> String {
     let template = built_in_role_template(&role.template_key).ok();
     let prompt_pack = deserialize_json_or_default::<CollabPromptPack>(&role.prompt_pack_json);
-    let capabilities = deserialize_json_or_default::<Vec<CollabCapabilityManifestItem>>(&role.capabilities_json);
+    let capabilities =
+        deserialize_json_or_default::<Vec<CollabCapabilityManifestItem>>(&role.capabilities_json);
     let capabilities_text = if capabilities.is_empty() {
         "无额外能力声明".to_string()
     } else {
@@ -1977,7 +2034,11 @@ fn build_collab_dispatch_prompt(
                     "- {}（{} / {}）：{}",
                     item.label,
                     item.source,
-                    if item.manual_only { "需人工触发" } else { "可直接使用" },
+                    if item.manual_only {
+                        "需人工触发"
+                    } else {
+                        "可直接使用"
+                    },
                     item.description
                 )
             })
@@ -2054,7 +2115,11 @@ fn read_collab_role_output_since(
     Ok((pieces.join("\n\n"), last_seen))
 }
 
-fn extract_json_block<T: DeserializeOwned>(content: &str, start_tag: &str, end_tag: &str) -> Option<T> {
+fn extract_json_block<T: DeserializeOwned>(
+    content: &str,
+    start_tag: &str,
+    end_tag: &str,
+) -> Option<T> {
     let start = content.rfind(start_tag)?;
     let suffix = &content[start + start_tag.len()..];
     let end = suffix.find(end_tag)?;
@@ -2075,7 +2140,11 @@ fn summarize_reply_content(content: &str, envelope: Option<&CollabReplyEnvelope>
         .map(|item| item.summary.trim().to_string())
         .filter(|item| !item.is_empty())
         .unwrap_or_else(|| content.trim().to_string());
-    let compact = summary.replace('\r', "").replace('\n', " ").trim().to_string();
+    let compact = summary
+        .replace('\r', "")
+        .replace('\n', " ")
+        .trim()
+        .to_string();
     if compact.chars().count() <= 220 {
         compact
     } else {
@@ -2145,16 +2214,21 @@ fn find_collab_role_for_plan<'a>(
     if normalized.is_empty() {
         return None;
     }
-    roles.iter()
+    roles
+        .iter()
         .find(|role| role.role_key.trim().eq_ignore_ascii_case(&normalized))
         .or_else(|| {
-            roles
-                .iter()
-                .find(|role| role.template_key.trim().eq_ignore_ascii_case(role_key.trim()))
+            roles.iter().find(|role| {
+                role.template_key
+                    .trim()
+                    .eq_ignore_ascii_case(role_key.trim())
+            })
         })
 }
 
-fn compute_plan_wave_map(tasks: &[(String, Vec<String>)]) -> Result<std::collections::HashMap<String, i64>, String> {
+fn compute_plan_wave_map(
+    tasks: &[(String, Vec<String>)],
+) -> Result<std::collections::HashMap<String, i64>, String> {
     fn visit(
         key: &str,
         adjacency: &std::collections::HashMap<String, Vec<String>>,
@@ -2206,7 +2280,9 @@ fn collab_task_dependencies_accepted(
     dependency_ids.into_iter().all(|dependency_id| {
         task_map
             .get(&dependency_id)
-            .map(|dependency| normalize_collab_task_status(&dependency.status) == CollabTaskStatus::Accepted)
+            .map(|dependency| {
+                normalize_collab_task_status(&dependency.status) == CollabTaskStatus::Accepted
+            })
             .unwrap_or(false)
     })
 }
@@ -2231,7 +2307,11 @@ fn wait_for_collab_role_completion(
             return Ok(refreshed);
         }
         if started.elapsed().as_secs() >= timeout_secs.max(5) as u64 {
-            return Err(format!("role {} did not finish within {}s", refreshed.name, timeout_secs.max(5)));
+            return Err(format!(
+                "role {} did not finish within {}s",
+                refreshed.name,
+                timeout_secs.max(5)
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
     }
@@ -2247,7 +2327,10 @@ fn dispatch_collab_task_internal(
         return Err("task does not belong to workbench".to_string());
     }
     let task_status = normalize_collab_task_status(&task.status);
-    if !matches!(task_status, CollabTaskStatus::Draft | CollabTaskStatus::Queued) {
+    if !matches!(
+        task_status,
+        CollabTaskStatus::Draft | CollabTaskStatus::Queued
+    ) {
         return Err("task is not ready to dispatch".to_string());
     }
     let workbench = load_collab_workbench_row_db(&state.db_path, workbench_id)?;
@@ -2266,8 +2349,10 @@ fn dispatch_collab_task_internal(
         .and_then(|role_id| load_collab_role_row_db(&state.db_path, workbench_id, role_id).ok())
         .map(|item| item.name)
         .unwrap_or_else(|| "用户/工作台".to_string());
-    let prompt = build_collab_dispatch_prompt(&workbench, &run, Some(&source_role_name), &role, &task);
-    paste_to_pane_internal(state, &role.pane_id, &prompt, true).map_err(|error| error.to_string())?;
+    let prompt =
+        build_collab_dispatch_prompt(&workbench, &run, Some(&source_role_name), &role, &task);
+    paste_to_pane_internal(state, &role.pane_id, &prompt, true)
+        .map_err(|error| error.to_string())?;
     let sent_at = now_epoch();
     let _ = mutate_collab_role_db(&state.db_path, workbench_id, &role.role_id, |item| {
         item.last_sent_at = sent_at;
@@ -2318,7 +2403,8 @@ fn collect_collab_task_reply_internal(
     if task.dispatched_at <= 0 {
         return Err("task has not been dispatched yet".to_string());
     }
-    let (reply_output, last_seen_at) = read_collab_role_output_since(state, &role, task.dispatched_at)?;
+    let (reply_output, last_seen_at) =
+        read_collab_role_output_since(state, &role, task.dispatched_at)?;
     if reply_output.trim().is_empty() {
         let updated = mutate_collab_role_db(&state.db_path, workbench_id, &role.role_id, |item| {
             item.phase = collab_role_phase_key(CollabRolePhase::Error).to_string();
@@ -2424,8 +2510,20 @@ fn resolve_collab_task_internal(
         Some(&task.run_id),
         Some(&task.task_id),
         Some(&task.target_role_id),
-        if accepted { "reply_accepted" } else { "reply_rejected" },
-        &format!("{}：{}", if accepted { "采纳回执" } else { "驳回回执" }, task.title),
+        if accepted {
+            "reply_accepted"
+        } else {
+            "reply_rejected"
+        },
+        &format!(
+            "{}：{}",
+            if accepted {
+                "采纳回执"
+            } else {
+                "驳回回执"
+            },
+            task.title
+        ),
         if note_text.is_empty() {
             None
         } else {
@@ -2514,7 +2612,8 @@ pub(crate) fn collab_initialize_roles(
     }
     let mut created_pane_ids = Vec::new();
     for role in roles {
-        let (pane_id, created) = ensure_collab_role_pane(&app, &state, &workbench_id, &role.role_id)?;
+        let (pane_id, created) =
+            ensure_collab_role_pane(&app, &state, &workbench_id, &role.role_id)?;
         if created {
             created_pane_ids.push(pane_id);
         }
@@ -2576,7 +2675,9 @@ pub(crate) fn collab_remove_role(
     ensure_collab_schema(&state.db_path)?;
     let role = load_collab_role_row_db(&state.db_path, &workbench_id, &role_id)?;
     if count_tasks_for_role_db(&state.db_path, &role_id)? > 0 {
-        return Err("role already referenced by existing task cards and cannot be removed".to_string());
+        return Err(
+            "role already referenced by existing task cards and cannot be removed".to_string(),
+        );
     }
     delete_collab_role_db(&state.db_path, &workbench_id, &role_id)?;
     insert_collab_event_db(
@@ -2665,8 +2766,13 @@ pub(crate) fn collab_send_role_message(
     if session_id.is_empty() {
         return Err("role has no session id yet, please bind sid first".to_string());
     }
-    paste_to_pane_internal(&state, &role.pane_id, message.trim(), submit.unwrap_or(true))
-        .map_err(|error| error.to_string())?;
+    paste_to_pane_internal(
+        &state,
+        &role.pane_id,
+        message.trim(),
+        submit.unwrap_or(true),
+    )
+    .map_err(|error| error.to_string())?;
     let sent_at = now_epoch();
     let _ = mutate_collab_role_db(&state.db_path, &workbench_id, &role_id, |item| {
         item.last_sent_at = sent_at;
@@ -2899,7 +3005,11 @@ pub(crate) fn collab_auto_plan_run(
     let planner = roles
         .iter()
         .find(|role| role.template_key.trim().eq_ignore_ascii_case("planner"))
-        .or_else(|| roles.iter().find(|role| role.role_key.trim().eq_ignore_ascii_case("planner")))
+        .or_else(|| {
+            roles
+                .iter()
+                .find(|role| role.role_key.trim().eq_ignore_ascii_case("planner"))
+        })
         .cloned()
         .ok_or_else(|| "planner role is required for auto planning".to_string())?;
     if planner.pane_id.trim().is_empty() {
@@ -2911,7 +3021,8 @@ pub(crate) fn collab_auto_plan_run(
     }
 
     let prompt = build_collab_plan_prompt(&workbench, &run, &roles);
-    paste_to_pane_internal(&state, &planner.pane_id, &prompt, true).map_err(|error| error.to_string())?;
+    paste_to_pane_internal(&state, &planner.pane_id, &prompt, true)
+        .map_err(|error| error.to_string())?;
     let sent_at = now_epoch();
     let _ = mutate_collab_role_db(&state.db_path, &workbench_id, &planner.role_id, |item| {
         item.last_sent_at = sent_at;
@@ -2921,7 +3032,8 @@ pub(crate) fn collab_auto_plan_run(
 
     let planner = wait_for_collab_role_completion(&state, &planner, sent_at, 120, 5)?;
     invalidate_collab_role_preview_cache(&state, &planner);
-    let (planner_output, planner_last_seen_at) = read_collab_role_output_since(&state, &planner, sent_at)?;
+    let (planner_output, planner_last_seen_at) =
+        read_collab_role_output_since(&state, &planner, sent_at)?;
     if planner_output.trim().is_empty() {
         return Err("planner returned no output".to_string());
     }
@@ -2953,8 +3065,12 @@ pub(crate) fn collab_auto_plan_run(
         if !seen_plan_keys.insert(key.clone()) {
             return Err(format!("planner returned duplicate task key {}", key));
         }
-        let role = find_collab_role_for_plan(&roles, &item.role_key)
-            .ok_or_else(|| format!("planner referenced unknown role_key {}", item.role_key.trim()))?;
+        let role = find_collab_role_for_plan(&roles, &item.role_key).ok_or_else(|| {
+            format!(
+                "planner referenced unknown role_key {}",
+                item.role_key.trim()
+            )
+        })?;
         let goal = item.goal.trim().to_string();
         if goal.is_empty() {
             return Err(format!("planner task {} has empty goal", key));
@@ -2969,9 +3085,21 @@ pub(crate) fn collab_auto_plan_run(
             },
             goal,
             normalize_dependency_keys(item.dependencies.as_ref(), &key),
-            item.constraints_text.clone().unwrap_or_default().trim().to_string(),
-            item.input_summary.clone().unwrap_or_default().trim().to_string(),
-            item.expected_output.clone().unwrap_or_default().trim().to_string(),
+            item.constraints_text
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            item.input_summary
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            item.expected_output
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
         ));
     }
 
@@ -2987,8 +3115,19 @@ pub(crate) fn collab_auto_plan_run(
         .collect::<std::collections::HashMap<_, _>>();
     let created_at = now_epoch();
     let mut created_task_ids = Vec::new();
-    for (index, (key, target_role_id, title, goal, dependencies, constraints_text, input_summary, expected_output)) in
-        normalized_plan.iter().enumerate()
+    for (
+        index,
+        (
+            key,
+            target_role_id,
+            title,
+            goal,
+            dependencies,
+            constraints_text,
+            input_summary,
+            expected_output,
+        ),
+    ) in normalized_plan.iter().enumerate()
     {
         let dependency_task_ids = dependencies
             .iter()
@@ -3131,9 +3270,16 @@ pub(crate) fn collab_dispatch_ready_wave(
     if ready_tasks.is_empty() {
         return Err("no ready task wave can be dispatched".to_string());
     }
-    let wave_index = ready_tasks.iter().map(|task| task.wave_index).min().unwrap_or(0);
+    let wave_index = ready_tasks
+        .iter()
+        .map(|task| task.wave_index)
+        .min()
+        .unwrap_or(0);
     let mut dispatched_task_ids = Vec::new();
-    for task in ready_tasks.into_iter().filter(|task| task.wave_index == wave_index) {
+    for task in ready_tasks
+        .into_iter()
+        .filter(|task| task.wave_index == wave_index)
+    {
         let _ = dispatch_collab_task_internal(&state, &workbench_id, &task.task_id)?;
         dispatched_task_ids.push(task.task_id);
     }
@@ -3189,14 +3335,21 @@ pub(crate) fn collab_auto_validate_wave(
     let mut rejected_task_ids = Vec::new();
     let mut waiting_task_ids = Vec::new();
 
-    for task in tasks.into_iter().filter(|task| task.wave_index == wave_index) {
+    for task in tasks
+        .into_iter()
+        .filter(|task| task.wave_index == wave_index)
+    {
         let task_status = normalize_collab_task_status(&task.status);
         if collab_task_is_terminal(task_status) {
             continue;
         }
         if task_status == CollabTaskStatus::Dispatched {
-            let (_collected_task, _artifact, waiting) =
-                collect_collab_task_reply_internal(&state, &workbench_id, &task.task_id, idle_threshold_secs.unwrap_or(5))?;
+            let (_collected_task, _artifact, waiting) = collect_collab_task_reply_internal(
+                &state,
+                &workbench_id,
+                &task.task_id,
+                idle_threshold_secs.unwrap_or(5),
+            )?;
             if waiting {
                 waiting_task_ids.push(task.task_id.clone());
                 continue;
@@ -3207,11 +3360,16 @@ pub(crate) fn collab_auto_validate_wave(
             let artifact = latest_task
                 .latest_artifact_id
                 .as_deref()
-                .and_then(|artifact_id| load_collab_artifact_row_db(&state.db_path, artifact_id).ok());
+                .and_then(|artifact_id| {
+                    load_collab_artifact_row_db(&state.db_path, artifact_id).ok()
+                });
             let reply_envelope = artifact
                 .as_ref()
                 .and_then(|item| extract_collab_reply_block(&item.content));
-            let accepted = reply_envelope.as_ref().map(|item| item.done).unwrap_or(false);
+            let accepted = reply_envelope
+                .as_ref()
+                .map(|item| item.done)
+                .unwrap_or(false);
             let summary = reply_envelope
                 .as_ref()
                 .map(|item| item.summary.trim().to_string())
@@ -3229,7 +3387,13 @@ pub(crate) fn collab_auto_validate_wave(
             } else {
                 format!("自动校验未通过：{}", summary)
             };
-            let _ = resolve_collab_task_internal(&state, &workbench_id, &task.task_id, accepted, &note)?;
+            let _ = resolve_collab_task_internal(
+                &state,
+                &workbench_id,
+                &task.task_id,
+                accepted,
+                &note,
+            )?;
             if accepted {
                 accepted_task_ids.push(task.task_id.clone());
             } else {
@@ -3242,7 +3406,10 @@ pub(crate) fn collab_auto_validate_wave(
             latest_task.status = collab_task_status_key(CollabTaskStatus::Rejected).to_string();
             latest_task.validation_summary = Some(format!(
                 "自动校验失败：{}",
-                latest_task.last_error.clone().unwrap_or_else(|| "unknown error".to_string())
+                latest_task
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string())
             ));
             latest_task.validation_checked_at = now;
             latest_task.resolved_at = now;
@@ -3315,7 +3482,10 @@ pub(crate) fn collab_dispatch_task_card(
         return Err("task does not belong to workbench".to_string());
     }
     let task_status = normalize_collab_task_status(&task.status);
-    if !matches!(task_status, CollabTaskStatus::Draft | CollabTaskStatus::Queued) {
+    if !matches!(
+        task_status,
+        CollabTaskStatus::Draft | CollabTaskStatus::Queued
+    ) {
         return Err("task is not ready to dispatch".to_string());
     }
     let workbench = load_collab_workbench_row_db(&state.db_path, &workbench_id)?;
@@ -3334,8 +3504,10 @@ pub(crate) fn collab_dispatch_task_card(
         .and_then(|role_id| load_collab_role_row_db(&state.db_path, &workbench_id, role_id).ok())
         .map(|item| item.name)
         .unwrap_or_else(|| "用户/工作台".to_string());
-    let prompt = build_collab_dispatch_prompt(&workbench, &run, Some(&source_role_name), &role, &task);
-    paste_to_pane_internal(&state, &role.pane_id, &prompt, true).map_err(|error| error.to_string())?;
+    let prompt =
+        build_collab_dispatch_prompt(&workbench, &run, Some(&source_role_name), &role, &task);
+    paste_to_pane_internal(&state, &role.pane_id, &prompt, true)
+        .map_err(|error| error.to_string())?;
     let sent_at = now_epoch();
     let _ = mutate_collab_role_db(&state.db_path, &workbench_id, &role.role_id, |item| {
         item.last_sent_at = sent_at;
@@ -3377,7 +3549,8 @@ pub(crate) fn collab_collect_role_reply(
         return Err("task does not belong to workbench".to_string());
     }
     let role = load_collab_role_row_db(&state.db_path, &workbench_id, &task.target_role_id)?;
-    let status = compute_collab_role_status_from_row(&state, &role, idle_threshold_secs.unwrap_or(5))?;
+    let status =
+        compute_collab_role_status_from_row(&state, &role, idle_threshold_secs.unwrap_or(5))?;
     if !status.completed {
         return Ok(CollabCollectRoleReplyResponse {
             snapshot: load_collab_snapshot_db(&state, &workbench_id)?,
@@ -3402,12 +3575,14 @@ pub(crate) fn collab_collect_role_reply(
     if task.dispatched_at <= 0 {
         return Err("task has not been dispatched yet".to_string());
     }
-    let (reply_output, last_seen_at) = read_collab_role_output_since(&state, &role, task.dispatched_at)?;
+    let (reply_output, last_seen_at) =
+        read_collab_role_output_since(&state, &role, task.dispatched_at)?;
     if reply_output.trim().is_empty() {
-        let updated = mutate_collab_role_db(&state.db_path, &workbench_id, &role.role_id, |item| {
-            item.phase = collab_role_phase_key(CollabRolePhase::Error).to_string();
-            item.last_error = Some("no output collected for dispatched task".to_string());
-        })?;
+        let updated =
+            mutate_collab_role_db(&state.db_path, &workbench_id, &role.role_id, |item| {
+                item.phase = collab_role_phase_key(CollabRolePhase::Error).to_string();
+                item.last_error = Some("no output collected for dispatched task".to_string());
+            })?;
         task.last_error = updated.last_error.clone();
         task.updated_at = now_epoch();
         save_collab_task_db(&state.db_path, &task)?;
@@ -3491,7 +3666,11 @@ pub(crate) fn collab_accept_reply(
     task.status = collab_task_status_key(CollabTaskStatus::Accepted).to_string();
     task.resolved_at = now_epoch();
     task.updated_at = task.resolved_at;
-    task.last_error = if note_text.is_empty() { None } else { Some(note_text.clone()) };
+    task.last_error = if note_text.is_empty() {
+        None
+    } else {
+        Some(note_text.clone())
+    };
     save_collab_task_db(&state.db_path, &task)?;
     insert_collab_event_db(
         &state.db_path,

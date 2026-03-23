@@ -1,4 +1,7 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 mod ai_team_mcp;
 mod collab_workbench;
@@ -16,7 +19,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use rhai::{AST, Dynamic, Engine, Scope};
+use rhai::{Dynamic, Engine, Scope, AST};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use strip_ansi_escapes::strip;
@@ -505,7 +508,10 @@ fn session_debug_enabled() -> bool {
         match std::env::var("AISHELL_SESSION_DEBUG") {
             Ok(value) => {
                 let normalized = value.trim().to_lowercase();
-                normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+                normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on"
             }
             Err(_) => false,
         }
@@ -716,9 +722,10 @@ fn init_schema(path: &Path) -> Result<()> {
         "#,
     )?;
 
-    if let Err(error) =
-        connection.execute("ALTER TABLE panes ADD COLUMN closed INTEGER NOT NULL DEFAULT 0", [])
-    {
+    if let Err(error) = connection.execute(
+        "ALTER TABLE panes ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
+        [],
+    ) {
         let message = error.to_string().to_lowercase();
         if !message.contains("duplicate column name") {
             return Err(error.into());
@@ -811,18 +818,20 @@ fn init_schema(path: &Path) -> Result<()> {
         "#,
     )?;
 
-    if let Err(error) =
-        connection.execute("ALTER TABLE pane_codex_state ADD COLUMN active_session_id TEXT", [])
-    {
+    if let Err(error) = connection.execute(
+        "ALTER TABLE pane_codex_state ADD COLUMN active_session_id TEXT",
+        [],
+    ) {
         let message = error.to_string().to_lowercase();
         if !message.contains("duplicate column name") {
             return Err(error.into());
         }
     }
 
-    if let Err(error) =
-        connection.execute("ALTER TABLE pane_codex_state ADD COLUMN linked_session_ids TEXT", [])
-    {
+    if let Err(error) = connection.execute(
+        "ALTER TABLE pane_codex_state ADD COLUMN linked_session_ids TEXT",
+        [],
+    ) {
         let message = error.to_string().to_lowercase();
         if !message.contains("duplicate column name") {
             return Err(error.into());
@@ -905,7 +914,9 @@ fn session_cache_ttl_secs(state: &AppState) -> i64 {
         .app_config
         .lock()
         .ok()
-        .map(|config| normalize_native_session_cache_ttl_secs(config.native_session_list_cache_ttl_secs))
+        .map(|config| {
+            normalize_native_session_cache_ttl_secs(config.native_session_list_cache_ttl_secs)
+        })
         .unwrap_or(DEFAULT_NATIVE_SESSION_CACHE_TTL_SECS)
 }
 
@@ -1032,7 +1043,11 @@ fn built_in_adapter_configs() -> Vec<AdapterConfig> {
             send_candidates: vec![
                 AdapterSendCandidateConfig {
                     mode: "codex-exec-json".to_string(),
-                    args: vec!["exec".to_string(), "{prompt}".to_string(), "--json".to_string()],
+                    args: vec![
+                        "exec".to_string(),
+                        "{prompt}".to_string(),
+                        "--json".to_string(),
+                    ],
                 },
                 AdapterSendCandidateConfig {
                     mode: "codex-exec-text".to_string(),
@@ -1178,11 +1193,19 @@ fn parse_adapter_config_blob(path: &Path, raw: &str) -> Vec<AdapterConfig> {
     let parsed = if extension == "yaml" || extension == "yml" {
         serde_yaml::from_str::<Vec<AdapterConfig>>(raw)
             .ok()
-            .or_else(|| serde_yaml::from_str::<AdapterConfig>(raw).ok().map(|item| vec![item]))
+            .or_else(|| {
+                serde_yaml::from_str::<AdapterConfig>(raw)
+                    .ok()
+                    .map(|item| vec![item])
+            })
     } else {
         serde_json::from_str::<Vec<AdapterConfig>>(raw)
             .ok()
-            .or_else(|| serde_json::from_str::<AdapterConfig>(raw).ok().map(|item| vec![item]))
+            .or_else(|| {
+                serde_json::from_str::<AdapterConfig>(raw)
+                    .ok()
+                    .map(|item| vec![item])
+            })
     };
 
     parsed.unwrap_or_default()
@@ -1412,6 +1435,68 @@ fn built_in_session_parser_configs() -> Vec<SessionParserConfig> {
     ]
 }
 
+fn merge_session_parser_config_defaults(
+    defaults: &SessionParserConfig,
+    mut config: SessionParserConfig,
+) -> SessionParserConfig {
+    let mut applied_defaults = false;
+
+    if config
+        .name
+        .as_ref()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        config.name = defaults.name.clone();
+        applied_defaults = true;
+    }
+    if config.source_roots.is_empty() {
+        config.source_roots = defaults.source_roots.clone();
+        applied_defaults = true;
+    }
+    if config.default_file_glob.trim().is_empty() {
+        config.default_file_glob = defaults.default_file_glob.clone();
+        applied_defaults = true;
+    }
+    if config.session_id_paths.is_empty() {
+        config.session_id_paths = defaults.session_id_paths.clone();
+        applied_defaults = true;
+    }
+    if config.started_at_paths.is_empty() {
+        config.started_at_paths = defaults.started_at_paths.clone();
+        applied_defaults = true;
+    }
+    if config.session_meta_filters.is_empty() {
+        config.session_meta_filters = defaults.session_meta_filters.clone();
+        applied_defaults = true;
+    }
+    if config.message_source_path.trim().is_empty() {
+        config.message_source_path = defaults.message_source_path.clone();
+        applied_defaults = true;
+    }
+    if config.message_rules.is_empty() && config.line_parser_script.trim().is_empty() {
+        config.message_rules = defaults.message_rules.clone();
+        applied_defaults = true;
+    }
+    if config.fallback_timestamp_paths.is_empty() {
+        config.fallback_timestamp_paths = defaults.fallback_timestamp_paths.clone();
+        applied_defaults = true;
+    }
+    if config.line_parser_function.trim().is_empty() {
+        config.line_parser_function = defaults.line_parser_function.clone();
+        applied_defaults = true;
+    }
+
+    if applied_defaults {
+        session_debug_log(&format!(
+            "session parser {} external override was missing critical fields; merged built-in defaults",
+            config.id
+        ));
+    }
+
+    config
+}
+
 fn normalize_filter(item: JsonFieldEqualsFilter) -> Option<JsonFieldEqualsFilter> {
     let path = item.path.trim().to_string();
     let equals = item.equals.trim().to_string();
@@ -1595,21 +1680,29 @@ fn parse_session_parser_config_blob(path: &Path, raw: &str) -> Vec<SessionParser
         .unwrap_or_default();
 
     let parsed = if extension == "yaml" || extension == "yml" {
-        serde_yaml::from_str::<Vec<SessionParserConfig>>(raw).ok().or_else(|| {
-            serde_yaml::from_str::<SessionParserConfig>(raw)
-                .ok()
-                .map(|item| vec![item])
-        })
+        serde_yaml::from_str::<Vec<SessionParserConfig>>(raw)
+            .ok()
+            .or_else(|| {
+                serde_yaml::from_str::<SessionParserConfig>(raw)
+                    .ok()
+                    .map(|item| vec![item])
+            })
     } else {
         serde_json::from_str::<Vec<SessionParserConfig>>(raw)
             .ok()
-            .or_else(|| serde_json::from_str::<SessionParserConfig>(raw).ok().map(|item| vec![item]))
+            .or_else(|| {
+                serde_json::from_str::<SessionParserConfig>(raw)
+                    .ok()
+                    .map(|item| vec![item])
+            })
     };
 
     parsed.unwrap_or_default()
 }
 
-fn load_external_session_parser_configs(session_parser_config_dir: &Path) -> Vec<SessionParserConfig> {
+fn load_external_session_parser_configs(
+    session_parser_config_dir: &Path,
+) -> Vec<SessionParserConfig> {
     if !session_parser_config_dir.exists() {
         return Vec::new();
     }
@@ -1646,13 +1739,20 @@ fn load_external_session_parser_configs(session_parser_config_dir: &Path) -> Vec
 
 fn load_registered_session_parsers(session_parser_config_dir: &Path) -> Vec<SessionParserConfig> {
     let mut by_id = HashMap::<String, SessionParserConfig>::new();
+    let mut built_in_by_id = HashMap::<String, SessionParserConfig>::new();
     for config in built_in_session_parser_configs() {
         if let Some(normalized) = normalize_session_parser_config(config) {
+            built_in_by_id.insert(normalized.id.clone(), normalized.clone());
             by_id.insert(normalized.id.clone(), normalized);
         }
     }
     for config in load_external_session_parser_configs(session_parser_config_dir) {
-        by_id.insert(config.id.clone(), config);
+        let merged = if let Some(defaults) = built_in_by_id.get(&config.id) {
+            merge_session_parser_config_defaults(defaults, config)
+        } else {
+            config
+        };
+        by_id.insert(merged.id.clone(), merged);
     }
     let mut items = by_id.into_values().collect::<Vec<_>>();
     items.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1729,9 +1829,17 @@ fn parse_session_parser_configs_from_text(raw: &str) -> Vec<SessionParserConfig>
     }
     serde_json::from_str::<Vec<SessionParserConfig>>(trimmed)
         .ok()
-        .or_else(|| serde_json::from_str::<SessionParserConfig>(trimmed).ok().map(|item| vec![item]))
+        .or_else(|| {
+            serde_json::from_str::<SessionParserConfig>(trimmed)
+                .ok()
+                .map(|item| vec![item])
+        })
         .or_else(|| serde_yaml::from_str::<Vec<SessionParserConfig>>(trimmed).ok())
-        .or_else(|| serde_yaml::from_str::<SessionParserConfig>(trimmed).ok().map(|item| vec![item]))
+        .or_else(|| {
+            serde_yaml::from_str::<SessionParserConfig>(trimmed)
+                .ok()
+                .map(|item| vec![item])
+        })
         .unwrap_or_default()
 }
 
@@ -1755,8 +1863,13 @@ fn upsert_session_parser_profile_from_text(
     let path = session_parser_config_dir.join(format!("{}.json", normalized.id));
     let payload = serde_json::to_string_pretty(&normalized)
         .map_err(|error| format!("failed to serialize session parser config: {}", error))?;
-    std::fs::write(&path, payload)
-        .map_err(|error| format!("failed to write session parser config {}: {}", path.to_string_lossy(), error))?;
+    std::fs::write(&path, payload).map_err(|error| {
+        format!(
+            "failed to write session parser config {}: {}",
+            path.to_string_lossy(),
+            error
+        )
+    })?;
     Ok(normalized)
 }
 
@@ -1951,10 +2064,16 @@ fn detect_pane_session_id_via_status_inner(
     let timeout = timeout_secs_override
         .unwrap_or(profile.timeout_secs)
         .clamp(1, 30);
-    let (initial_revision, initial_text) = snapshot_pane_output_buffer(&state.pane_output_buffers, pane_id);
+    let (initial_revision, initial_text) =
+        snapshot_pane_output_buffer(&state.pane_output_buffers, pane_id);
     let initial_len = initial_text.len();
-    write_to_pane_internal(state, pane_id, &format!("{}\r", profile.probe_command), false)
-        .map_err(|error| error.to_string())?;
+    write_to_pane_internal(
+        state,
+        pane_id,
+        &format!("{}\r", profile.probe_command),
+        false,
+    )
+    .map_err(|error| error.to_string())?;
 
     let started = std::time::Instant::now();
     let timeout_duration = std::time::Duration::from_secs(timeout as u64);
@@ -1962,12 +2081,15 @@ fn detect_pane_session_id_via_status_inner(
     loop {
         let (revision, text) = snapshot_pane_output_buffer(&state.pane_output_buffers, pane_id);
         if revision > initial_revision {
-            let candidate_slice = if text.len() >= initial_len && text.is_char_boundary(initial_len) {
+            let candidate_slice = if text.len() >= initial_len && text.is_char_boundary(initial_len)
+            {
                 &text[initial_len..]
             } else {
                 text.as_str()
             };
-            if let Some(session_id) = extract_session_id_from_status_output(candidate_slice, profile.labels) {
+            if let Some(session_id) =
+                extract_session_id_from_status_output(candidate_slice, profile.labels)
+            {
                 if let Some(cleanup_input) = profile.cleanup_input {
                     let _ = write_to_pane_internal(state, pane_id, cleanup_input, false);
                 }
@@ -2005,13 +2127,10 @@ fn should_drop_codex_instruction_line(line: &str) -> bool {
     if exact_markers.iter().any(|item| *item == normalized) {
         return true;
     }
-    let prefix_markers = [
-        "<cwd>",
-        "<shell>",
-        "<current_date>",
-        "<timezone>",
-    ];
-    prefix_markers.iter().any(|marker| normalized.starts_with(marker))
+    let prefix_markers = ["<cwd>", "<shell>", "<current_date>", "<timezone>"];
+    prefix_markers
+        .iter()
+        .any(|marker| normalized.starts_with(marker))
 }
 
 fn sanitize_codex_import_content(content: &str) -> String {
@@ -2261,16 +2380,17 @@ fn list_entries_db(
                     LIMIT ?3 OFFSET ?4
                     "#,
                 )?;
-                let rows = stmt.query_map(params![pane_id, like, page_limit, page_offset], |row| {
-                    Ok(EntryRecord {
-                        id: row.get(0)?,
-                        pane_id: row.get(1)?,
-                        kind: row.get(2)?,
-                        content: row.get(3)?,
-                        synced_from: row.get(4)?,
-                        created_at: row.get(5)?,
-                    })
-                })?;
+                let rows =
+                    stmt.query_map(params![pane_id, like, page_limit, page_offset], |row| {
+                        Ok(EntryRecord {
+                            id: row.get(0)?,
+                            pane_id: row.get(1)?,
+                            kind: row.get(2)?,
+                            content: row.get(3)?,
+                            synced_from: row.get(4)?,
+                            created_at: row.get(5)?,
+                        })
+                    })?;
                 for row in rows {
                     result.push(row?);
                 }
@@ -2485,7 +2605,10 @@ fn clear_pane_history_db(path: &Path, pane_id: &str) -> Result<()> {
         "DELETE FROM codex_import_state WHERE pane_id = ?1",
         params![pane_id],
     )?;
-    tx.execute("DELETE FROM pane_codex_state WHERE pane_id = ?1", params![pane_id])?;
+    tx.execute(
+        "DELETE FROM pane_codex_state WHERE pane_id = ?1",
+        params![pane_id],
+    )?;
     tx.execute(
         "UPDATE panes SET updated_at = ?2 WHERE id = ?1",
         params![pane_id, now_epoch()],
@@ -2664,7 +2787,9 @@ impl SessionFileMatcher {
     fn from_raw(raw: &str) -> Option<Self> {
         let mut patterns = Vec::new();
         for chunk in split_scan_glob_patterns(raw) {
-            let normalized = expand_env_placeholders(&chunk).replace('\\', "/").to_lowercase();
+            let normalized = expand_env_placeholders(&chunk)
+                .replace('\\', "/")
+                .to_lowercase();
             if normalized.is_empty() {
                 continue;
             }
@@ -2689,7 +2814,8 @@ impl SessionFileMatcher {
             .map(|item| item.to_lowercase())
             .unwrap_or_default();
         self.patterns.iter().any(|pattern| {
-            wildcard_match(pattern, &full) || (!file_name.is_empty() && wildcard_match(pattern, &file_name))
+            wildcard_match(pattern, &full)
+                || (!file_name.is_empty() && wildcard_match(pattern, &file_name))
         })
     }
 }
@@ -2706,7 +2832,11 @@ fn build_native_preview_cache_key(
     matcher: Option<&SessionFileMatcher>,
     session_id: &str,
 ) -> String {
-    format!("{}::preview::{}", build_native_scan_cache_key(provider, matcher), session_id.trim())
+    format!(
+        "{}::preview::{}",
+        build_native_scan_cache_key(provider, matcher),
+        session_id.trim()
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2838,7 +2968,9 @@ fn first_string_from_paths(value: &serde_json::Value, paths: &[String]) -> Optio
 fn parse_epoch_seconds_loose(value: &serde_json::Value) -> Option<i64> {
     match value {
         serde_json::Value::Number(number) => {
-            let raw = number.as_i64().or_else(|| number.as_u64().map(|item| item as i64))?;
+            let raw = number
+                .as_i64()
+                .or_else(|| number.as_u64().map(|item| item as i64))?;
             if raw > 10_000_000_000_i64 {
                 Some(raw / 1000)
             } else {
@@ -2888,7 +3020,9 @@ fn value_matches_filter(value: &serde_json::Value, filter: &JsonFieldEqualsFilte
 }
 
 fn all_filters_match(value: &serde_json::Value, filters: &[JsonFieldEqualsFilter]) -> bool {
-    filters.iter().all(|filter| value_matches_filter(value, filter))
+    filters
+        .iter()
+        .all(|filter| value_matches_filter(value, filter))
 }
 
 fn any_truthy_path(value: &serde_json::Value, paths: &[String]) -> bool {
@@ -3131,8 +3265,9 @@ fn parse_message_rows_with_rule(
     for (item_index, item) in items.into_iter().enumerate() {
         if let Some(expected_type) = expected_content_type.as_ref() {
             if !rule.content_item_filter_path.trim().is_empty() {
-                let actual = first_string_from_paths(&item, &[rule.content_item_filter_path.clone()])
-                    .unwrap_or_default();
+                let actual =
+                    first_string_from_paths(&item, &[rule.content_item_filter_path.clone()])
+                        .unwrap_or_default();
                 if actual != *expected_type {
                     continue;
                 }
@@ -3198,7 +3333,10 @@ fn build_line_script_runtime(parser: &SessionParserConfig) -> Result<LineScriptR
 }
 
 fn script_value_to_non_empty_string(value: Option<&serde_json::Value>) -> Option<String> {
-    value.and_then(json_value_to_string).map(|text| text.trim().to_string()).filter(|text| !text.is_empty())
+    value
+        .and_then(json_value_to_string)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 fn normalize_script_kind(raw_kind: &str, raw_role: &str) -> Option<String> {
@@ -3248,7 +3386,11 @@ fn parse_script_row_from_object(
     let created_at = row_object
         .get("created_at")
         .and_then(parse_epoch_seconds_loose)
-        .or_else(|| row_object.get("timestamp").and_then(parse_epoch_seconds_loose))
+        .or_else(|| {
+            row_object
+                .get("timestamp")
+                .and_then(parse_epoch_seconds_loose)
+        })
         .unwrap_or(fallback_timestamp);
     let content = if parser.strip_codex_tags {
         sanitize_codex_import_content(&raw_content)
@@ -3297,19 +3439,17 @@ fn parse_script_output_rows(
                            line_no: i64,
                            content_index: usize,
                            target_session_id: Option<&str>| {
-        value
-            .as_object()
-            .and_then(|item| {
-                parse_script_row_from_object(
-                    parser,
-                    item,
-                    fallback_session_id,
-                    fallback_timestamp,
-                    line_no,
-                    content_index,
-                    target_session_id,
-                )
-            })
+        value.as_object().and_then(|item| {
+            parse_script_row_from_object(
+                parser,
+                item,
+                fallback_session_id,
+                fallback_timestamp,
+                line_no,
+                content_index,
+                target_session_id,
+            )
+        })
     };
 
     match output_value {
@@ -3399,7 +3539,11 @@ fn apply_script_parse_result(
     if output.started_at <= 0 {
         if let Some(value) = started_at.filter(|value| *value > 0) {
             output.started_at = value;
-        } else if let Some(value) = rows.iter().map(|item| item.created_at).find(|value| *value > 0) {
+        } else if let Some(value) = rows
+            .iter()
+            .map(|item| item.created_at)
+            .find(|value| *value > 0)
+        {
             output.started_at = value;
         }
     }
@@ -3440,7 +3584,12 @@ fn invoke_line_parser_script(
             &runtime.function_name,
             (line_dynamic, ctx_dynamic),
         )
-        .map_err(|error| format!("line parser function {} failed: {}", runtime.function_name, error))?;
+        .map_err(|error| {
+            format!(
+                "line parser function {} failed: {}",
+                runtime.function_name, error
+            )
+        })?;
     let output_value: serde_json::Value = rhai::serde::from_dynamic(&dynamic_result)
         .map_err(|error| format!("failed to decode script output JSON: {}", error))?;
     Ok(parse_script_output_rows(
@@ -3643,7 +3792,13 @@ fn parse_jsonl_session_file(
     max_rows: Option<usize>,
 ) -> ParsedSessionFile {
     if parser_uses_line_script(parser) {
-        return parse_jsonl_session_file_with_script(parser, path, mtime, target_session_id, max_rows);
+        return parse_jsonl_session_file_with_script(
+            parser,
+            path,
+            mtime,
+            target_session_id,
+            max_rows,
+        );
     }
     let mut output = ParsedSessionFile::default();
     let file = match File::open(path) {
@@ -3687,8 +3842,8 @@ fn parse_jsonl_session_file(
                     output.session_id = first_string_from_paths(&value, &parser.session_id_paths);
                 }
                 if output.started_at <= 0 {
-                    output.started_at =
-                        first_epoch_from_paths(&value, &parser.started_at_paths).unwrap_or_default();
+                    output.started_at = first_epoch_from_paths(&value, &parser.started_at_paths)
+                        .unwrap_or_default();
                 }
             }
         }
@@ -3714,17 +3869,14 @@ fn parse_jsonl_session_file(
                     line_no,
                 );
                 if output.session_id.is_none() {
-                    if let Some(found) = rows
-                        .iter()
-                        .find_map(|item| {
-                            let sid = item.session_id.trim();
-                            if sid.is_empty() {
-                                None
-                            } else {
-                                Some(sid.to_string())
-                            }
-                        })
-                    {
+                    if let Some(found) = rows.iter().find_map(|item| {
+                        let sid = item.session_id.trim();
+                        if sid.is_empty() {
+                            None
+                        } else {
+                            Some(sid.to_string())
+                        }
+                    }) {
                         output.session_id = Some(found);
                     }
                 }
@@ -3754,7 +3906,13 @@ fn parse_json_session_file(
     max_rows: Option<usize>,
 ) -> ParsedSessionFile {
     if parser_uses_line_script(parser) {
-        return parse_json_session_file_with_script(parser, path, mtime, target_session_id, max_rows);
+        return parse_json_session_file_with_script(
+            parser,
+            path,
+            mtime,
+            target_session_id,
+            max_rows,
+        );
     }
     let mut output = ParsedSessionFile::default();
     let raw = match std::fs::read_to_string(path) {
@@ -3772,9 +3930,12 @@ fn parse_json_session_file(
         }
     };
     output.scanned_units = 1;
-    if parser.session_meta_filters.is_empty() || all_filters_match(&value, &parser.session_meta_filters) {
+    if parser.session_meta_filters.is_empty()
+        || all_filters_match(&value, &parser.session_meta_filters)
+    {
         output.session_id = first_string_from_paths(&value, &parser.session_id_paths);
-        output.started_at = first_epoch_from_paths(&value, &parser.started_at_paths).unwrap_or_default();
+        output.started_at =
+            first_epoch_from_paths(&value, &parser.started_at_paths).unwrap_or_default();
     }
     let fallback_timestamp = first_epoch_from_paths(&value, &parser.fallback_timestamp_paths)
         .or_else(|| first_epoch_from_paths(&value, &parser.started_at_paths))
@@ -3799,17 +3960,14 @@ fn parse_json_session_file(
                 line_no,
             );
             if output.session_id.is_none() {
-                if let Some(found) = rows
-                    .iter()
-                    .find_map(|item| {
-                        let sid = item.session_id.trim();
-                        if sid.is_empty() {
-                            None
-                        } else {
-                            Some(sid.to_string())
-                        }
-                    })
-                {
+                if let Some(found) = rows.iter().find_map(|item| {
+                    let sid = item.session_id.trim();
+                    if sid.is_empty() {
+                        None
+                    } else {
+                        Some(sid.to_string())
+                    }
+                }) {
                     output.session_id = Some(found);
                 }
             }
@@ -3900,10 +4058,12 @@ fn read_first_json_value_from_file(path: &Path, file_format: &str) -> Result<ser
         return Ok(value);
     }
 
-    let file = File::open(path).with_context(|| format!("failed to open file {}", path.to_string_lossy()))?;
+    let file = File::open(path)
+        .with_context(|| format!("failed to open file {}", path.to_string_lossy()))?;
     let reader = BufReader::new(file);
     for row in reader.lines().take(4096) {
-        let line = row.with_context(|| format!("failed to read line {}", path.to_string_lossy()))?;
+        let line =
+            row.with_context(|| format!("failed to read line {}", path.to_string_lossy()))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -3990,7 +4150,8 @@ fn read_first_message_sample_value_from_file(
 
     for (line_index, row) in reader.lines().take(4096).enumerate() {
         let line_no = (line_index + 1) as i64;
-        let line = row.with_context(|| format!("failed to read line {}", path.to_string_lossy()))?;
+        let line =
+            row.with_context(|| format!("failed to read line {}", path.to_string_lossy()))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -4031,7 +4192,10 @@ fn resolve_session_parser_for_preview(
     parser_profile: &str,
     parser_config_text: Option<&str>,
 ) -> Result<SessionParserConfig> {
-    if let Some(raw) = parser_config_text.map(|item| item.trim()).filter(|item| !item.is_empty()) {
+    if let Some(raw) = parser_config_text
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+    {
         if let Some(config) = parse_session_parser_configs_from_text(raw)
             .into_iter()
             .next()
@@ -4134,7 +4298,11 @@ fn collect_parser_metas_indexed(
             .map(|item| item.trim().to_string())
             .filter(|item| !item.is_empty())
         {
-            let started_at = if parsed.started_at > 0 { parsed.started_at } else { mtime };
+            let started_at = if parsed.started_at > 0 {
+                parsed.started_at
+            } else {
+                mtime
+            };
             let file_time_key = generic_file_time_key(&file_path, started_at, mtime);
             let first_input = first_input_preview_from_parsed_rows(&parsed.rows);
             let row = NativeSessionFileIndexRow {
@@ -4145,9 +4313,12 @@ fn collect_parser_metas_indexed(
                 record_count: parsed.rows.len() as i64,
                 first_input: first_input.clone(),
             };
-            if let Err(error) =
-                upsert_native_session_file_index_row(&connection, &parser.id, &file_path_string, &row)
-            {
+            if let Err(error) = upsert_native_session_file_index_row(
+                &connection,
+                &parser.id,
+                &file_path_string,
+                &row,
+            ) {
                 set_native_session_index_progress(
                     state,
                     &parser.id,
@@ -4170,7 +4341,8 @@ fn collect_parser_metas_indexed(
                 first_input,
             });
         } else {
-            let _ = delete_native_session_file_index_row(&connection, &parser.id, &file_path_string);
+            let _ =
+                delete_native_session_file_index_row(&connection, &parser.id, &file_path_string);
             if indexed.remove(&file_path_string).is_some() {
                 changed_files += 1;
             }
@@ -4308,8 +4480,14 @@ fn parse_rfc3339_epoch_seconds(value: &str) -> Option<i64> {
     let offset_seconds = match value.as_bytes().get(offset_marker).copied() {
         Some(b'Z') => 0_i64,
         Some(sign @ (b'+' | b'-')) => {
-            let tz_hour: i64 = value.get(offset_marker + 1..offset_marker + 3)?.parse().ok()?;
-            let tz_minute: i64 = value.get(offset_marker + 4..offset_marker + 6)?.parse().ok()?;
+            let tz_hour: i64 = value
+                .get(offset_marker + 1..offset_marker + 3)?
+                .parse()
+                .ok()?;
+            let tz_minute: i64 = value
+                .get(offset_marker + 4..offset_marker + 6)?
+                .parse()
+                .ok()?;
             if tz_hour > 23 || tz_minute > 59 {
                 return None;
             }
@@ -4324,7 +4502,8 @@ fn parse_rfc3339_epoch_seconds(value: &str) -> Option<i64> {
     };
 
     let unix_days = days_from_civil(year, month, day);
-    let unix_seconds = unix_days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64;
+    let unix_seconds =
+        unix_days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64;
     Some(unix_seconds - offset_seconds)
 }
 
@@ -4504,7 +4683,11 @@ fn upsert_native_session_file_index_row(
     Ok(())
 }
 
-fn delete_native_session_file_index_row(connection: &Connection, provider: &str, file_path: &str) -> Result<()> {
+fn delete_native_session_file_index_row(
+    connection: &Connection,
+    provider: &str,
+    file_path: &str,
+) -> Result<()> {
     connection.execute(
         "DELETE FROM native_session_file_index WHERE provider = ?1 AND file_path = ?2",
         params![provider, file_path],
@@ -4641,9 +4824,14 @@ fn compact_whitespace(text: &str) -> String {
 
 fn sanitize_session_question_preview(text: &str) -> String {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let stripped = ["INSTRUCTIONS", "environment_context", "permissions", "collaboration_mode"]
-        .into_iter()
-        .fold(normalized, |acc, tag| strip_tag_block(&acc, tag));
+    let stripped = [
+        "INSTRUCTIONS",
+        "environment_context",
+        "permissions",
+        "collaboration_mode",
+    ]
+    .into_iter()
+    .fold(normalized, |acc, tag| strip_tag_block(&acc, tag));
     let mut lines = Vec::new();
     for line in stripped.lines() {
         let trimmed = line.trim();
@@ -4816,7 +5004,9 @@ fn collect_native_session_preview_rows_for_provider(
     session_id: &str,
     matcher: Option<&SessionFileMatcher>,
 ) -> Result<Vec<NativeSessionPreviewRow>> {
-    collect_native_session_preview_rows_for_provider_limited(state, provider, session_id, matcher, None)
+    collect_native_session_preview_rows_for_provider_limited(
+        state, provider, session_id, matcher, None,
+    )
 }
 
 fn collect_native_session_preview_rows_for_provider_limited(
@@ -4829,8 +5019,12 @@ fn collect_native_session_preview_rows_for_provider_limited(
     let parser = resolve_session_parser_profile(&state.session_parser_config_dir, provider)
         .ok_or_else(|| anyhow!("session parser profile not found: {}", provider))?;
     let connection = open_db(&state.db_path)?;
-    let mut metas =
-        collect_native_session_metas_from_index(&connection, &parser.id, Some(session_id), matcher)?;
+    let mut metas = collect_native_session_metas_from_index(
+        &connection,
+        &parser.id,
+        Some(session_id),
+        matcher,
+    )?;
     if metas.is_empty() {
         let refreshed = collect_parser_metas_indexed(state, &parser, matcher)?;
         metas = refreshed
@@ -4915,8 +5109,8 @@ fn load_native_session_candidates_cache_first(
     }
 
     let connection = open_db(&state.db_path).map_err(|error| error.to_string())?;
-    let indexed =
-        load_native_session_file_index_rows(&connection, provider).map_err(|error| error.to_string())?;
+    let indexed = load_native_session_file_index_rows(&connection, provider)
+        .map_err(|error| error.to_string())?;
     let batch = build_native_session_candidates_batch_from_index_rows(
         provider,
         indexed,
@@ -4958,20 +5152,21 @@ fn load_native_session_record_count_cached(
     let indexed_count = if matcher.is_none() {
         open_db(&state.db_path)
             .and_then(|connection| {
-                connection.query_row(
-                    r#"
+                connection
+                    .query_row(
+                        r#"
                     SELECT COUNT(1), COALESCE(SUM(record_count), 0)
                     FROM native_session_file_index
                     WHERE provider = ?1 AND session_id = ?2
                     "#,
-                    params![provider, session_id],
-                    |row| {
-                        let rows = row.get::<usize, i64>(0)?;
-                        let sum = row.get::<usize, i64>(1)?;
-                        Ok((rows, sum))
-                    },
-                )
-                .map_err(Into::into)
+                        params![provider, session_id],
+                        |row| {
+                            let rows = row.get::<usize, i64>(0)?;
+                            let sum = row.get::<usize, i64>(1)?;
+                            Ok((rows, sum))
+                        },
+                    )
+                    .map_err(Into::into)
             })
             .ok()
             .and_then(|(rows, sum)| if rows > 0 { Some(sum) } else { None })
@@ -5199,7 +5394,11 @@ fn invalidate_native_session_preview_cache(state: &AppState, provider: &str) {
     }
 }
 
-fn load_pane_scan_config_db(path: &Path, pane_id: &str, fallback_provider: &str) -> Result<PaneScanConfig> {
+fn load_pane_scan_config_db(
+    path: &Path,
+    pane_id: &str,
+    fallback_provider: &str,
+) -> Result<PaneScanConfig> {
     let connection = open_db(path)?;
     let row = connection
         .query_row(
@@ -5228,7 +5427,8 @@ fn load_pane_scan_config_db(path: &Path, pane_id: &str, fallback_provider: &str)
         file_glob: String::new(),
         updated_at: 0,
     });
-    config.parser_profile = normalize_native_scan_profile(&config.parser_profile, fallback_provider);
+    config.parser_profile =
+        normalize_native_scan_profile(&config.parser_profile, fallback_provider);
     config.file_glob = normalize_scan_glob(&config.file_glob);
     Ok(config)
 }
@@ -5264,7 +5464,11 @@ fn upsert_pane_scan_config_db(
     load_pane_scan_config_db(path, pane_id, fallback_provider)
 }
 
-fn resolve_pane_scan_config(state: &AppState, pane_id: &str, provider: &str) -> Result<PaneScanConfig, String> {
+fn resolve_pane_scan_config(
+    state: &AppState,
+    pane_id: &str,
+    provider: &str,
+) -> Result<PaneScanConfig, String> {
     load_pane_scan_config_db(&state.db_path, pane_id, provider).map_err(|error| error.to_string())
 }
 
@@ -5302,9 +5506,7 @@ fn load_pane_session_state_db(path: &Path, pane_id: &str) -> Result<PaneSessionS
                 Ok(PaneSessionState {
                     pane_id: pane_id.to_string(),
                     active_session_id: item.get::<usize, String>(0)?,
-                    linked_session_ids: parse_json_session_ids(
-                        &item.get::<usize, String>(1)?,
-                    ),
+                    linked_session_ids: parse_json_session_ids(&item.get::<usize, String>(1)?),
                     include_linked_in_sync: item.get::<usize, i64>(2)? > 0,
                     updated_at: item.get::<usize, i64>(3)?,
                 })
@@ -5365,7 +5567,9 @@ fn upsert_pane_session_state_db(
     load_pane_session_state_db(path, pane_id)
 }
 
-fn row_to_favorite_message_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FavoriteMessageRecord> {
+fn row_to_favorite_message_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<FavoriteMessageRecord> {
     Ok(FavoriteMessageRecord {
         id: row.get::<usize, String>(0)?,
         pane_id: row.get::<usize, String>(1)?,
@@ -5462,9 +5666,10 @@ fn upsert_favorite_message_db(
     let favorited_at = now_epoch();
 
     let connection = open_db(path)?;
-    let favorite_id = find_favorite_message_by_target_db(&connection, &pane_id, &session_id, &message_id)?
-        .map(|item| item.id)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let favorite_id =
+        find_favorite_message_by_target_db(&connection, &pane_id, &session_id, &message_id)?
+            .map(|item| item.id)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
     connection.execute(
         r#"
         INSERT INTO favorite_messages
@@ -5661,7 +5866,12 @@ fn build_sync_payload(path: &Path, entry_ids: &[String]) -> Result<(String, Opti
     Ok((contents.join("\n\n"), first_id))
 }
 
-fn start_runtime(app: &AppHandle, state: &AppState, pane_id: String, _provider: String) -> Result<()> {
+fn start_runtime(
+    app: &AppHandle,
+    state: &AppState,
+    pane_id: String,
+    _provider: String,
+) -> Result<()> {
     {
         let runtimes = state
             .panes
@@ -5790,8 +6000,8 @@ fn normalize_directory_path(path: String) -> Result<PathBuf> {
 }
 
 fn normalize_workdir_binding_key(path: String) -> Result<String> {
-    let normalized = normalize_working_directory(Some(path))?
-        .ok_or_else(|| anyhow!("workdir is empty"))?;
+    let normalized =
+        normalize_working_directory(Some(path))?.ok_or_else(|| anyhow!("workdir is empty"))?;
     Ok(normalized.to_string_lossy().to_string())
 }
 
@@ -6228,7 +6438,8 @@ fn list_entries(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<EntryRecord>, String> {
-    list_entries_db(&state.db_path, &pane_id, query, limit, offset).map_err(|error| error.to_string())
+    list_entries_db(&state.db_path, &pane_id, query, limit, offset)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -6593,12 +6804,13 @@ fn import_native_history_inner(
     let target_session_id = if let Some(sid) = requested {
         sid
     } else {
-        suggest_native_session_id_inner(state, pane_id, provider, runtime_start, matcher)?.ok_or_else(|| {
-            format!(
-                "current {} session not detected yet; send first message then retry import",
-                provider
-            )
-        })?
+        suggest_native_session_id_inner(state, pane_id, provider, runtime_start, matcher)?
+            .ok_or_else(|| {
+                format!(
+                    "current {} session not detected yet; send first message then retry import",
+                    provider
+                )
+            })?
     };
 
     let filtered_metas = metas
@@ -6620,9 +6832,12 @@ fn import_native_history_inner(
         .join(" ; ");
 
     let mut connection = open_db(&state.db_path).map_err(|error| error.to_string())?;
-    let tx = connection.transaction().map_err(|error| error.to_string())?;
+    let tx = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
     if session_role == "active" {
-        save_bound_session_id(&tx, pane_id, &target_session_id).map_err(|error| error.to_string())?;
+        save_bound_session_id(&tx, pane_id, &target_session_id)
+            .map_err(|error| error.to_string())?;
     }
 
     let mut result = NativeImportResult {
@@ -6642,13 +6857,18 @@ fn import_native_history_inner(
         "native:{}:{}:{}",
         parser.id,
         target_session_id,
-        if session_role == "linked" { "linked" } else { "active" }
+        if session_role == "linked" {
+            "linked"
+        } else {
+            "active"
+        }
     );
 
     if parser.strip_codex_tags {
         let stale_pattern = format!("native:{}:{}:%", parser.id, target_session_id);
-        let _ = tx.execute(
-            r#"
+        let _ = tx
+            .execute(
+                r#"
             DELETE FROM entries
             WHERE pane_id = ?1
               AND synced_from LIKE ?2
@@ -6661,9 +6881,9 @@ fn import_native_history_inner(
                 OR lower(content) LIKE '%<collaboration_mode>%'
               )
             "#,
-            params![pane_id, stale_pattern],
-        )
-        .map_err(|error| error.to_string())?;
+                params![pane_id, stale_pattern],
+            )
+            .map_err(|error| error.to_string())?;
     }
 
     for meta in filtered_metas {
@@ -6675,8 +6895,8 @@ fn import_native_history_inner(
             continue;
         }
 
-        let (last_line, last_mtime) =
-            load_codex_import_cursor(&tx, pane_id, &cursor_key).map_err(|error| error.to_string())?;
+        let (last_line, last_mtime) = load_codex_import_cursor(&tx, pane_id, &cursor_key)
+            .map_err(|error| error.to_string())?;
         if parser.file_format == "json" && last_line > 0 && mtime <= last_mtime {
             continue;
         }
@@ -6775,7 +6995,10 @@ fn import_native_history_inner(
 }
 
 #[tauri::command]
-fn suggest_native_session_id(state: State<AppState>, pane_id: String) -> Result<Option<String>, String> {
+fn suggest_native_session_id(
+    state: State<AppState>,
+    pane_id: String,
+) -> Result<Option<String>, String> {
     let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
     detect_pane_session_id_via_status_inner(&state, &pane_id, &provider, None)
 }
@@ -6817,8 +7040,9 @@ fn list_native_session_candidates(
     let should_refresh_cache = !cache_only.unwrap_or(true);
     let _ = full_load;
     let batch = if should_refresh_cache {
-        let parser = resolve_session_parser_profile(&state.session_parser_config_dir, &native_provider)
-            .ok_or_else(|| format!("session parser profile not found: {}", native_provider))?;
+        let parser =
+            resolve_session_parser_profile(&state.session_parser_config_dir, &native_provider)
+                .ok_or_else(|| format!("session parser profile not found: {}", native_provider))?;
         let indexed = collect_parser_metas_indexed(&state, &parser, matcher.as_ref())
             .map_err(|error| error.to_string())?;
         let batch = build_native_session_candidates_batch_from_metas(
@@ -6880,10 +7104,7 @@ fn list_native_session_candidates(
         .trim()
         .to_lowercase();
     let desc = normalized_sort_order != "asc";
-    let sid_keyword_value = sid_keyword
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
+    let sid_keyword_value = sid_keyword.unwrap_or_default().trim().to_lowercase();
     let mut time_from_value = time_from.filter(|value| *value > 0);
     let mut time_to_value = time_to.filter(|value| *value > 0);
     if let (Some(from), Some(to)) = (time_from_value, time_to_value) {
@@ -7016,8 +7237,16 @@ fn list_native_session_candidates(
         });
     } else if sort_by_created {
         all_items.sort_by(|a, b| {
-            let a_created = if a.started_at > 0 { a.started_at } else { a.last_seen_at };
-            let b_created = if b.started_at > 0 { b.started_at } else { b.last_seen_at };
+            let a_created = if a.started_at > 0 {
+                a.started_at
+            } else {
+                a.last_seen_at
+            };
+            let b_created = if b.started_at > 0 {
+                b.started_at
+            } else {
+                b.last_seen_at
+            };
             let ord = a_created
                 .cmp(&b_created)
                 .then(a.last_seen_at.cmp(&b.last_seen_at))
@@ -7030,8 +7259,16 @@ fn list_native_session_candidates(
         });
     } else if sort_by_updated {
         all_items.sort_by(|a, b| {
-            let a_updated = if a.last_seen_at > 0 { a.last_seen_at } else { a.started_at };
-            let b_updated = if b.last_seen_at > 0 { b.last_seen_at } else { b.started_at };
+            let a_updated = if a.last_seen_at > 0 {
+                a.last_seen_at
+            } else {
+                a.started_at
+            };
+            let b_updated = if b.last_seen_at > 0 {
+                b.last_seen_at
+            } else {
+                b.started_at
+            };
             let ord = a_updated
                 .cmp(&b_updated)
                 .then(a.started_at.cmp(&b.started_at))
@@ -7159,7 +7396,8 @@ fn preview_session_parser_sample(
     parser_config_text: Option<String>,
     file_glob: Option<String>,
 ) -> Result<SessionParserSamplePreviewResponse, String> {
-    let normalized_profile = normalize_native_scan_profile(&parser_profile, DEFAULT_NATIVE_SCAN_PROFILE);
+    let normalized_profile =
+        normalize_native_scan_profile(&parser_profile, DEFAULT_NATIVE_SCAN_PROFILE);
     let parser = resolve_session_parser_for_preview(
         &state,
         &normalized_profile,
@@ -7167,15 +7405,17 @@ fn preview_session_parser_sample(
     )
     .map_err(|error| error.to_string())?;
     let matcher = SessionFileMatcher::from_raw(file_glob.as_deref().unwrap_or_default());
-    let files =
-        collect_parser_candidate_files(&parser, matcher.as_ref()).map_err(|error| error.to_string())?;
+    let files = collect_parser_candidate_files(&parser, matcher.as_ref())
+        .map_err(|error| error.to_string())?;
     if files.is_empty() {
         return Err("no matching files found for parser sample preview".to_string());
     }
     for file_path in files {
         if let Ok(sample_value) = read_first_json_value_from_file(&file_path, &parser.file_format) {
             let message_sample_value =
-                read_first_message_sample_value_from_file(&parser, &file_path).ok().flatten();
+                read_first_message_sample_value_from_file(&parser, &file_path)
+                    .ok()
+                    .flatten();
             return Ok(SessionParserSamplePreviewResponse {
                 parser_profile: parser.id.clone(),
                 file_path: file_path.to_string_lossy().to_string(),
@@ -7203,7 +7443,8 @@ fn reindex_native_sessions(
     let cache_ttl_secs = session_cache_ttl_secs(&state);
     clear_native_session_caches_for_provider(&state, &native_provider);
     let connection = open_db(&state.db_path).map_err(|error| error.to_string())?;
-    clear_native_session_file_index_rows(&connection, &native_provider).map_err(|error| error.to_string())?;
+    clear_native_session_file_index_rows(&connection, &native_provider)
+        .map_err(|error| error.to_string())?;
     let indexed = collect_parser_metas_indexed(&state, &parser, matcher.as_ref())
         .map_err(|error| error.to_string())?;
     if cache_ttl_secs > 0 {
@@ -7213,12 +7454,7 @@ fn reindex_native_sessions(
             indexed.unrecognized_files,
         );
         if let Ok(mut cache) = state.native_session_candidates_cache.lock() {
-            cache.insert(
-                cache_key,
-                NativeSessionCandidatesCache {
-                    batch,
-                },
-            );
+            cache.insert(cache_key, NativeSessionCandidatesCache { batch });
         }
     }
     load_native_session_index_progress_for_provider(&state, &native_provider)
@@ -7249,12 +7485,7 @@ fn refresh_native_session_cache(
     invalidate_native_session_record_count_cache_by_provider(&state, &native_provider);
     invalidate_native_session_first_input_cache_by_provider(&state, &native_provider);
     if let Ok(mut cache) = state.native_session_candidates_cache.lock() {
-        cache.insert(
-            cache_key,
-            NativeSessionCandidatesCache {
-                batch,
-            },
-        );
+        cache.insert(cache_key, NativeSessionCandidatesCache { batch });
     }
     load_native_session_index_progress_for_provider(&state, &native_provider)
 }
@@ -7295,7 +7526,10 @@ fn preview_native_session_messages(
         .map_err(|error| error.to_string())?
     } else if let Ok(cache) = state.native_session_preview_cache.lock() {
         if let Some(hit) = cache.get(&cache_key) {
-            if cache_ttl_secs > 0 && now.saturating_sub(hit.updated_at) <= cache_ttl_secs && !hit.rows.is_empty() {
+            if cache_ttl_secs > 0
+                && now.saturating_sub(hit.updated_at) <= cache_ttl_secs
+                && !hit.rows.is_empty()
+            {
                 hit.rows.clone()
             } else {
                 collect_native_session_preview_rows_for_provider(
@@ -7345,12 +7579,26 @@ fn preview_native_session_messages(
         let end = total.saturating_sub(message_offset);
         let start = end.saturating_sub(message_limit);
         let has_more = start > 0;
-        (all_rows.into_iter().skip(start).take(end.saturating_sub(start)).collect::<Vec<_>>(), has_more)
+        (
+            all_rows
+                .into_iter()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .collect::<Vec<_>>(),
+            has_more,
+        )
     } else {
         let start = message_offset.min(all_rows.len());
         let end = (start + message_limit).min(all_rows.len());
         let has_more = end < all_rows.len();
-        (all_rows.into_iter().skip(start).take(end.saturating_sub(start)).collect::<Vec<_>>(), has_more)
+        (
+            all_rows
+                .into_iter()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .collect::<Vec<_>>(),
+            has_more,
+        )
     };
     let loaded_rows = rows.len();
     Ok(NativeSessionPreviewResponse {
@@ -7416,7 +7664,12 @@ fn sync_native_session_messages(
         .map_err(|error| error.to_string())?;
     let entry = add_entry(&state.db_path, &target_pane_id, "input", &normalized, None)
         .map_err(|error| error.to_string())?;
-    log_entry_event(&state, &entry, "sync_native_session_messages", Some("sync-native-preview"));
+    log_entry_event(
+        &state,
+        &entry,
+        "sync_native_session_messages",
+        Some("sync-native-preview"),
+    );
     Ok(entry)
 }
 
@@ -7439,8 +7692,8 @@ fn load_native_session_message_details_inner(
     }
 
     let provider = load_provider(&state.db_path, pane_id)?;
-    let scan_config = resolve_pane_scan_config(state, pane_id, &provider)
-        .map_err(|error| anyhow!(error))?;
+    let scan_config =
+        resolve_pane_scan_config(state, pane_id, &provider).map_err(|error| anyhow!(error))?;
     let native_provider = scan_config.parser_profile;
     let parser = resolve_session_parser_profile(&state.session_parser_config_dir, &native_provider)
         .ok_or_else(|| anyhow!("session parser profile not found: {}", native_provider))?;
@@ -7493,10 +7746,13 @@ fn load_native_session_message_details_inner(
         }
 
         for (file_path, requests) in file_groups {
-            let parsed = parse_session_file(&parser, &PathBuf::from(&file_path), Some(&session_id), None);
+            let parsed =
+                parse_session_file(&parser, &PathBuf::from(&file_path), Some(&session_id), None);
             for (locator, message_id) in requests {
                 let row = find_parsed_message_by_locator(&parsed.rows, &locator, &session_id)
-                    .ok_or_else(|| anyhow!("message detail not found; source log may have changed"))?;
+                    .ok_or_else(|| {
+                        anyhow!("message detail not found; source log may have changed")
+                    })?;
                 details.push(NativeSessionMessageDetailResponse {
                     message_id,
                     session_id: session_id.clone(),
@@ -7539,8 +7795,16 @@ fn preview_native_unrecognized_file(
 ) -> Result<NativeUnrecognizedFilePreviewResponse, String> {
     let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
     let scan_config = resolve_pane_scan_config(&state, &pane_id, &provider)?;
-    let parser = resolve_session_parser_profile(&state.session_parser_config_dir, &scan_config.parser_profile)
-        .ok_or_else(|| format!("session parser profile not found: {}", scan_config.parser_profile))?;
+    let parser = resolve_session_parser_profile(
+        &state.session_parser_config_dir,
+        &scan_config.parser_profile,
+    )
+    .ok_or_else(|| {
+        format!(
+            "session parser profile not found: {}",
+            scan_config.parser_profile
+        )
+    })?;
 
     let trimmed_path = file_path.trim();
     if trimmed_path.is_empty() {
@@ -7589,10 +7853,11 @@ fn list_parser_unrecognized_files_by_index(
     parser: &SessionParserConfig,
     matcher: Option<&SessionFileMatcher>,
 ) -> Result<Vec<NativeSessionUnrecognizedFile>, String> {
-    let files = collect_parser_candidate_files(parser, matcher).map_err(|error| error.to_string())?;
+    let files =
+        collect_parser_candidate_files(parser, matcher).map_err(|error| error.to_string())?;
     let connection = open_db(&state.db_path).map_err(|error| error.to_string())?;
-    let indexed =
-        load_native_session_file_index_rows(&connection, &parser.id).map_err(|error| error.to_string())?;
+    let indexed = load_native_session_file_index_rows(&connection, &parser.id)
+        .map_err(|error| error.to_string())?;
     let mut output = Vec::<NativeSessionUnrecognizedFile>::new();
     for file_path in files {
         let file_path_string = file_path.to_string_lossy().to_string();
@@ -7629,8 +7894,16 @@ fn list_native_unrecognized_files(
 ) -> Result<Vec<NativeSessionUnrecognizedFile>, String> {
     let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
     let scan_config = resolve_pane_scan_config(&state, &pane_id, &provider)?;
-    let parser = resolve_session_parser_profile(&state.session_parser_config_dir, &scan_config.parser_profile)
-        .ok_or_else(|| format!("session parser profile not found: {}", scan_config.parser_profile))?;
+    let parser = resolve_session_parser_profile(
+        &state.session_parser_config_dir,
+        &scan_config.parser_profile,
+    )
+    .ok_or_else(|| {
+        format!(
+            "session parser profile not found: {}",
+            scan_config.parser_profile
+        )
+    })?;
     let matcher = SessionFileMatcher::from_raw(&scan_config.file_glob);
     list_parser_unrecognized_files_by_index(&state, &parser, matcher.as_ref())
 }
@@ -7641,13 +7914,19 @@ fn clear_native_session_binding(state: State<AppState>, pane_id: String) -> Resu
 
     let connection = open_db(&state.db_path).map_err(|error| error.to_string())?;
     connection
-        .execute("DELETE FROM pane_codex_state WHERE pane_id = ?1", params![pane_id])
+        .execute(
+            "DELETE FROM pane_codex_state WHERE pane_id = ?1",
+            params![pane_id],
+        )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-fn get_pane_session_state(state: State<AppState>, pane_id: String) -> Result<PaneSessionState, String> {
+fn get_pane_session_state(
+    state: State<AppState>,
+    pane_id: String,
+) -> Result<PaneSessionState, String> {
     let _ = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
     load_pane_session_state_db(&state.db_path, &pane_id).map_err(|error| error.to_string())
 }
@@ -7807,7 +8086,10 @@ fn import_native_history(
 }
 
 #[tauri::command]
-fn suggest_codex_session_id(state: State<AppState>, pane_id: String) -> Result<Option<String>, String> {
+fn suggest_codex_session_id(
+    state: State<AppState>,
+    pane_id: String,
+) -> Result<Option<String>, String> {
     let provider = load_provider(&state.db_path, &pane_id).map_err(|error| error.to_string())?;
     if provider != "codex" {
         return Ok(None);
@@ -7823,7 +8105,10 @@ fn clear_codex_session_binding(state: State<AppState>, pane_id: String) -> Resul
     }
     let connection = open_db(&state.db_path).map_err(|error| error.to_string())?;
     connection
-        .execute("DELETE FROM pane_codex_state WHERE pane_id = ?1", params![pane_id])
+        .execute(
+            "DELETE FROM pane_codex_state WHERE pane_id = ?1",
+            params![pane_id],
+        )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -7900,7 +8185,8 @@ fn get_app_config(state: State<AppState>) -> Result<AppConfigResponse, String> {
     let ui_theme_preset = normalize_ui_theme_preset(&config.ui_theme_preset);
     let ui_skin_hue = normalize_ui_skin_hue(config.ui_skin_hue);
     let ui_skin_accent = normalize_hex_color(&config.ui_skin_accent, DEFAULT_UI_SKIN_ACCENT);
-    let user_avatar_path = normalize_avatar_path(&config.user_avatar_path, DEFAULT_USER_AVATAR_PATH);
+    let user_avatar_path =
+        normalize_avatar_path(&config.user_avatar_path, DEFAULT_USER_AVATAR_PATH);
     let assistant_avatar_path =
         normalize_avatar_path(&config.assistant_avatar_path, DEFAULT_ASSISTANT_AVATAR_PATH);
     Ok(AppConfigResponse {
@@ -7964,7 +8250,9 @@ fn set_avatar_config(
 
     let next_user_avatar_path = user_avatar_path
         .map(|value| normalize_avatar_path(&value, DEFAULT_USER_AVATAR_PATH))
-        .unwrap_or_else(|| normalize_avatar_path(&config.user_avatar_path, DEFAULT_USER_AVATAR_PATH));
+        .unwrap_or_else(|| {
+            normalize_avatar_path(&config.user_avatar_path, DEFAULT_USER_AVATAR_PATH)
+        });
     let next_assistant_avatar_path = assistant_avatar_path
         .map(|value| normalize_avatar_path(&value, DEFAULT_ASSISTANT_AVATAR_PATH))
         .unwrap_or_else(|| {
@@ -8075,7 +8363,9 @@ fn set_native_session_list_cache_ttl_secs(
 }
 
 #[tauri::command]
-fn list_workdir_session_bindings(state: State<AppState>) -> Result<Vec<WorkdirSessionBinding>, String> {
+fn list_workdir_session_bindings(
+    state: State<AppState>,
+) -> Result<Vec<WorkdirSessionBinding>, String> {
     list_workdir_session_bindings_db(&state.db_path).map_err(|error| error.to_string())
 }
 
@@ -8096,7 +8386,8 @@ fn delete_workdir_session_binding(
     workdir: String,
     provider: String,
 ) -> Result<(), String> {
-    delete_workdir_session_binding_db(&state.db_path, workdir, provider).map_err(|error| error.to_string())
+    delete_workdir_session_binding_db(&state.db_path, workdir, provider)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -8254,9 +8545,10 @@ fn cli_stats_db(path: &Path) -> Result<CliStats> {
     let panes_total = connection.query_row("SELECT COUNT(1) FROM panes", [], |row| {
         row.get::<usize, i64>(0)
     })?;
-    let panes_open = connection.query_row("SELECT COUNT(1) FROM panes WHERE closed = 0", [], |row| {
-        row.get::<usize, i64>(0)
-    })?;
+    let panes_open =
+        connection.query_row("SELECT COUNT(1) FROM panes WHERE closed = 0", [], |row| {
+            row.get::<usize, i64>(0)
+        })?;
     let entries_total = connection.query_row(
         "SELECT COUNT(1) FROM entries WHERE kind IN ('input','output')",
         [],
@@ -8275,7 +8567,12 @@ fn cli_stats_db(path: &Path) -> Result<CliStats> {
     let (first_entry_ts, last_entry_ts) = connection.query_row(
         "SELECT MIN(created_at), MAX(created_at) FROM entries WHERE kind IN ('input','output')",
         [],
-        |row| Ok((row.get::<usize, Option<i64>>(0)?, row.get::<usize, Option<i64>>(1)?)),
+        |row| {
+            Ok((
+                row.get::<usize, Option<i64>>(0)?,
+                row.get::<usize, Option<i64>>(1)?,
+            ))
+        },
     )?;
 
     Ok(CliStats {
@@ -8327,7 +8624,9 @@ fn prune_history_older_than_db(path: &Path, days: i64) -> Result<CliPruneReport>
 fn run_cli_action(action: &CliAction, db_path: &Path) -> Result<()> {
     match action {
         CliAction::Help => {
-            let binary = std::env::args().next().unwrap_or_else(|| "ai-shell".to_string());
+            let binary = std::env::args()
+                .next()
+                .unwrap_or_else(|| "ai-shell".to_string());
             println!("{}", cli_help_text(&binary));
             Ok(())
         }
@@ -8383,7 +8682,10 @@ fn run_cli_action(action: &CliAction, db_path: &Path) -> Result<()> {
             println!("  cutoff_epoch: {}", report.cutoff_epoch);
             println!("  deleted_entries: {}", report.deleted_entries);
             println!("  deleted_closed_panes: {}", report.deleted_closed_panes);
-            println!("  deleted_import_cursors: {}", report.deleted_import_cursors);
+            println!(
+                "  deleted_import_cursors: {}",
+                report.deleted_import_cursors
+            );
             println!("  deleted_bindings: {}", report.deleted_bindings);
             Ok(())
         }
@@ -8393,7 +8695,10 @@ fn run_cli_action(action: &CliAction, db_path: &Path) -> Result<()> {
             println!("  cutoff_epoch: {}", report.cutoff_epoch);
             println!("  deleted_entries: {}", report.deleted_entries);
             println!("  deleted_closed_panes: {}", report.deleted_closed_panes);
-            println!("  deleted_import_cursors: {}", report.deleted_import_cursors);
+            println!(
+                "  deleted_import_cursors: {}",
+                report.deleted_import_cursors
+            );
             println!("  deleted_bindings: {}", report.deleted_bindings);
             Ok(())
         }
@@ -8406,19 +8711,39 @@ fn main() {
         Ok(value) => value,
         Err(error) => {
             eprintln!("{}\n", error);
-            let binary = args.first().cloned().unwrap_or_else(|| "ai-shell".to_string());
+            let binary = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "ai-shell".to_string());
             eprintln!("{}", cli_help_text(&binary));
             std::process::exit(2);
         }
     };
 
     if matches!(cli_action, Some(CliAction::Help)) {
-        let binary = args.first().cloned().unwrap_or_else(|| "ai-shell".to_string());
+        let binary = args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "ai-shell".to_string());
         println!("{}", cli_help_text(&binary));
         return;
     }
 
-    tauri::Builder::default()
+    let cli_action_for_plugin = cli_action.clone();
+    let mut builder = tauri::Builder::default();
+
+    #[cfg(desktop)]
+    if cli_action_for_plugin.is_none() {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
@@ -8440,8 +8765,9 @@ fn main() {
             ensure_session_parser_sample_file(&session_parser_config_dir);
             init_schema(&db_path)?;
             let mut app_config = load_app_config(&config_path);
-            app_config.native_session_list_cache_ttl_secs =
-                normalize_native_session_cache_ttl_secs(app_config.native_session_list_cache_ttl_secs);
+            app_config.native_session_list_cache_ttl_secs = normalize_native_session_cache_ttl_secs(
+                app_config.native_session_list_cache_ttl_secs,
+            );
             app_config.ui_theme_preset = normalize_ui_theme_preset(&app_config.ui_theme_preset);
             app_config.ui_skin_hue = normalize_ui_skin_hue(app_config.ui_skin_hue);
             app_config.ui_skin_accent =
@@ -8452,8 +8778,9 @@ fn main() {
                 &app_config.assistant_avatar_path,
                 DEFAULT_ASSISTANT_AVATAR_PATH,
             );
-            let working_directory = normalize_working_directory(app_config.working_directory.clone())
-                .unwrap_or_default();
+            let working_directory =
+                normalize_working_directory(app_config.working_directory.clone())
+                    .unwrap_or_default();
 
             if let Some(action) = cli_action.as_ref() {
                 match run_cli_action(action, &db_path) {
